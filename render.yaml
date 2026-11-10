@@ -1,3 +1,4 @@
+# Render Free может засыпать; не подходит для гарантированного 24/7.
 services:
   - type: web
     name: telegram-ai-operator
