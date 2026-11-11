@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import uuid
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
@@ -43,11 +44,11 @@ AI_MODEL_FALLBACKS = [
     model.strip()
     for model in os.getenv(
         "AI_MODEL_FALLBACKS",
-        "openai/gpt-oss-20b,llama-3.3-70b-versatile"
+        "openai/gpt-oss-20b"
     ).split(",")
     if model.strip()
 ]
-DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "1.5"))
+DEBOUNCE_SECONDS = 0.0  # no artificial debounce; reply starts on first update
 MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "3500"))
 CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "16"))
 MAX_QUEUE_PER_USER = int(os.getenv("MAX_QUEUE_PER_USER", "100"))
@@ -193,6 +194,70 @@ workers = {}
 admin_pending = {}
 stopping = False
 scheduler_lock = asyncio.Lock()
+
+# A database-backed lease prevents two Railway replicas/deployments from polling
+# the same Telegram bot token at the same time.
+INSTANCE_ID = f"{os.getenv('RAILWAY_REPLICA_ID', 'replica')}:{uuid.uuid4().hex}"
+INSTANCE_LEASE_SECONDS = 120
+instance_lease_task = None
+
+
+def _claim_instance_lease():
+    now = now_utc()
+    until = now + timedelta(seconds=INSTANCE_LEASE_SECONDS)
+    payload = {
+        "lock_name": "telegram-ai-operator",
+        "owner_id": INSTANCE_ID,
+        "lease_until": iso(until),
+        "updated_at": iso(now),
+    }
+    try:
+        db.table("operator_runtime_lock").insert(payload).execute()
+        return True
+    except Exception:
+        # Existing lease: take over only if it has expired. The conditional
+        # UPDATE is atomic at Postgres level, so only one replica can win.
+        result = db.table("operator_runtime_lock").update({
+            "owner_id": INSTANCE_ID,
+            "lease_until": iso(until),
+            "updated_at": iso(now),
+        }).eq("lock_name", "telegram-ai-operator").lt(
+            "lease_until", iso(now)
+        ).select("owner_id").execute()
+        return bool(result.data and result.data[0].get("owner_id") == INSTANCE_ID)
+
+
+async def acquire_instance_lease():
+    ok = await asyncio.to_thread(_claim_instance_lease)
+    if not ok:
+        raise RuntimeError(
+            "Другой экземпляр уже владеет Telegram polling lock. "
+            "Оставьте одну Railway Replica/один активный сервис."
+        )
+    log.info("Instance lease acquired (instance_id=%s)", INSTANCE_ID)
+
+
+async def renew_instance_lease():
+    while not stopping:
+        await asyncio.sleep(30)
+        now = now_utc()
+        until = now + timedelta(seconds=INSTANCE_LEASE_SECONDS)
+        def renew():
+            result = db.table("operator_runtime_lock").update({
+                "lease_until": iso(until),
+                "updated_at": iso(now),
+            }).eq("lock_name", "telegram-ai-operator").eq(
+                "owner_id", INSTANCE_ID
+            ).select("owner_id").execute()
+            return bool(result.data)
+        if not await asyncio.to_thread(renew):
+            raise RuntimeError("Lost Telegram polling instance lease; stopping to avoid duplicate polling")
+
+
+async def release_instance_lease():
+    await asyncio.to_thread(lambda: db.table("operator_runtime_lock").delete().eq(
+        "lock_name", "telegram-ai-operator"
+    ).eq("owner_id", INSTANCE_ID).execute())
 
 
 def now_utc():
@@ -685,8 +750,13 @@ async def menu_and_text_handler(message: Message):
         await send_admin(message, await menu_text(), main_keyboard())
 
 
-async def build_context(chat_id):
-    messages = await user_client.get_messages(chat_id, limit=CONTEXT_MESSAGES)
+async def build_context(target):
+    # Live events carry the peer/access-hash needed for first-time contacts.
+    if hasattr(target, "get_input_chat"):
+        entity = await target.get_input_chat()
+    else:
+        entity = await user_client.get_entity(target)
+    messages = await user_client.get_messages(entity, limit=CONTEXT_MESSAGES)
     context = []
     for item in reversed(messages):
         if item.message:
@@ -697,8 +767,8 @@ async def build_context(chat_id):
     return context
 
 
-async def answer_with_ai(chat_id, extra_instruction=None):
-    context = await build_context(chat_id)
+async def answer_with_ai(target, extra_instruction=None):
+    context = await build_context(target)
     if not context:
         return ""
     system = await system_prompt()
@@ -732,21 +802,31 @@ async def answer_with_ai(chat_id, extra_instruction=None):
 
 
 async def process_event(event):
-    if not await enabled() or not await is_allowed_and_consented(event.sender_id):
+    sender_id = event.sender_id
+    if not await enabled():
+        log.info("Incoming update ignored: AI disabled (sender_id=%s)", sender_id)
         return
-    answer = await answer_with_ai(event.chat_id)
+    if not await is_allowed_and_consented(sender_id):
+        log.info("Incoming update ignored: contact not allowed/consented (sender_id=%s)", sender_id)
+        return
+    log.info("Generating reply (sender_id=%s)", sender_id)
+    answer = await answer_with_ai(event)
     if answer:
         await event.respond(answer)
+        log.info("Reply sent (sender_id=%s)", sender_id)
+    else:
+        log.warning("AI returned empty response (sender_id=%s)", sender_id)
 
 
 async def worker(user_id):
     q = queues[user_id]
     while not stopping:
         event = await q.get()
-        await asyncio.sleep(DEBOUNCE_SECONDS)
+        # No artificial debounce: process the first incoming message immediately.
         while True:
             try:
-                event = q.get_nowait()
+                newer_event = q.get_nowait()
+                event = newer_event
             except asyncio.QueueEmpty:
                 break
         try:
@@ -763,28 +843,38 @@ async def worker(user_id):
 
 @user_client.on(events.NewMessage(incoming=True))
 async def on_new_message(event):
-    if not event.is_private or event.sender_id is None or not (event.raw_text or "").strip():
+    sender_id = event.sender_id
+    if not event.is_private or sender_id is None or not (event.raw_text or "").strip():
         return
-    if not await is_allowed_and_consented(event.sender_id):
-        return
+    log.info("Incoming private message received (sender_id=%s)", sender_id)
     try:
-        await update_contact_incoming(event.sender_id)
+        if not await is_allowed_and_consented(sender_id):
+            log.info("Incoming update ignored: contact not allowed/consented (sender_id=%s)", sender_id)
+            return
+        if not await enabled():
+            log.info("Incoming update ignored: AI disabled (sender_id=%s)", sender_id)
+            return
+        q = queues.get(sender_id)
+        if q is None:
+            q = asyncio.Queue(maxsize=MAX_QUEUE_PER_USER)
+            queues[sender_id] = q
+        if q.full():
+            with suppress(asyncio.QueueEmpty):
+                q.get_nowait()
+        q.put_nowait(event)
+        task = workers.get(sender_id)
+        if task is None or task.done():
+            workers[sender_id] = asyncio.create_task(worker(sender_id))
+        asyncio.create_task(update_contact_incoming_safely(sender_id))
     except Exception:
-        log.exception("Could not persist incoming timestamp for %s", event.sender_id)
-        # Fail closed for scheduler bookkeeping, but still queue normal reply.
-    if not await enabled():
-        return
-    q = queues.get(event.sender_id)
-    if q is None:
-        q = asyncio.Queue(maxsize=MAX_QUEUE_PER_USER)
-        queues[event.sender_id] = q
-    if q.full():
-        with suppress(asyncio.QueueEmpty):
-            q.get_nowait()
-    q.put_nowait(event)
-    task = workers.get(event.sender_id)
-    if task is None or task.done():
-        workers[event.sender_id] = asyncio.create_task(worker(event.sender_id))
+        log.exception("Incoming event handler failed (sender_id=%s)", sender_id)
+
+
+async def update_contact_incoming_safely(sender_id):
+    try:
+        await update_contact_incoming(sender_id)
+    except Exception:
+        log.exception("Could not persist incoming timestamp (sender_id=%s)", sender_id)
 
 
 async def scheduler_loop():
@@ -858,6 +948,7 @@ async def health(request):
         return web.json_response({
             "status": "ok",
             "telegram_connected": user_client.is_connected(),
+            "instance_id": INSTANCE_ID,
             "enabled": await enabled(),
             "initiative_enabled": await initiative_enabled(),
         })
@@ -895,29 +986,49 @@ async def initialize_settings():
 
 
 async def main():
-    global stopping
-    await initialize_settings()
-    await user_client.connect()
-    if not await user_client.is_user_authorized():
-        raise RuntimeError("TELEGRAM_SESSION недействительна. Создайте новую локально.")
-    log.info("Telegram user session connected")
-    runner = await run_web()
-    scheduler_task = asyncio.create_task(scheduler_loop())
+    global stopping, instance_lease_task
+    await acquire_instance_lease()
     try:
-        await dp.start_polling(bot)
+        await initialize_settings()
+        log.info("Connecting Telethon user session...")
+        await user_client.connect()
+        if not await user_client.is_user_authorized():
+            raise RuntimeError("TELEGRAM_SESSION недействительна. Создайте новую локально.")
+        me = await user_client.get_me()
+        log.info(
+            "Telegram user session connected (account_id=%s username=%s)",
+            getattr(me, "id", None), getattr(me, "username", None)
+        )
+        telethon_updates_task = asyncio.create_task(
+            user_client.run_until_disconnected(), name="telethon-updates-loop"
+        )
+        runner = await run_web()
+        scheduler_task = asyncio.create_task(scheduler_loop(), name="initiative-scheduler")
+        instance_lease_task = asyncio.create_task(
+            renew_instance_lease(), name="instance-lease-renewal"
+        )
+        try:
+            await dp.start_polling(bot, handle_signals=False)
+        finally:
+            stopping = True
+            for task in (scheduler_task, telethon_updates_task, instance_lease_task):
+                if task and not task.done():
+                    task.cancel()
+                if task:
+                    with suppress(asyncio.CancelledError, Exception):
+                        await task
+            for task in workers.values():
+                task.cancel()
+            for task in workers.values():
+                with suppress(asyncio.CancelledError):
+                    await task
+            await runner.cleanup()
+            await user_client.disconnect()
+            await bot.session.close()
     finally:
         stopping = True
-        scheduler_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await scheduler_task
-        for task in workers.values():
-            task.cancel()
-        for task in workers.values():
-            with suppress(asyncio.CancelledError):
-                await task
-        await runner.cleanup()
-        await user_client.disconnect()
-        await bot.session.close()
+        with suppress(Exception):
+            await release_instance_lease()
 
 
 if __name__ == "__main__":
