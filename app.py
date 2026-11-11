@@ -8,7 +8,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, NotFoundError
 from supabase import create_client
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -37,8 +37,17 @@ GROQ_API_KEY = env("GROQ_API_KEY")
 SUPABASE_URL = env("SUPABASE_URL")
 SUPABASE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
 
-AI_MODEL = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
-DEBOUNCE_SECONDS = 0.0  # Immediate processing; no intentional debounce
+# Быстрая модель по умолчанию. Можно переопределить через Railway AI_MODEL.
+AI_MODEL = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
+AI_MODEL_FALLBACKS = [
+    model.strip()
+    for model in os.getenv(
+        "AI_MODEL_FALLBACKS",
+        "openai/gpt-oss-20b,llama-3.3-70b-versatile"
+    ).split(",")
+    if model.strip()
+]
+DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "1.5"))
 MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "3500"))
 CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "16"))
 MAX_QUEUE_PER_USER = int(os.getenv("MAX_QUEUE_PER_USER", "100"))
@@ -676,19 +685,8 @@ async def menu_and_text_handler(message: Message):
         await send_admin(message, await menu_text(), main_keyboard())
 
 
-async def build_context(target):
-    """
-    Build context using a Telethon event when replying to an incoming message.
-    An event carries peer information from the live update, which is essential
-    for a contact whose entity has not yet been cached in the session.
-    """
-    if hasattr(target, "get_input_chat"):
-        entity = await target.get_input_chat()
-    else:
-        # Scheduled messages have no live event; resolve the saved user ID.
-        entity = await user_client.get_entity(target)
-
-    messages = await user_client.get_messages(entity, limit=CONTEXT_MESSAGES)
+async def build_context(chat_id):
+    messages = await user_client.get_messages(chat_id, limit=CONTEXT_MESSAGES)
     context = []
     for item in reversed(messages):
         if item.message:
@@ -699,50 +697,53 @@ async def build_context(target):
     return context
 
 
-async def answer_with_ai(target, extra_instruction=None):
-    context = await build_context(target)
+async def answer_with_ai(chat_id, extra_instruction=None):
+    context = await build_context(chat_id)
     if not context:
         return ""
     system = await system_prompt()
     if extra_instruction:
         system += "\n\nДОПОЛНИТЕЛЬНАЯ ЗАДАЧА ДЛЯ ЭТОГО ОТВЕТА:\n" + extra_instruction
-    response = await llm.chat.completions.create(
-        model=AI_MODEL,
-        messages=[{"role": "system", "content": system}] + context,
-        temperature=0.7,
-        max_tokens=900,
-        timeout=45.0,
-    )
-    return (response.choices[0].message.content or "").strip()[:MAX_REPLY_CHARS]
+    messages = [{"role": "system", "content": system}] + context
+    # A model can disappear or be unavailable for a particular Groq API key.
+    # Retry only model-not-found/access errors using configured fallback IDs.
+    candidates = list(dict.fromkeys([AI_MODEL] + AI_MODEL_FALLBACKS))
+    last_error = None
+    for model_name in candidates:
+        try:
+            response = await llm.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=600,
+                timeout=30.0,
+            )
+            if model_name != AI_MODEL:
+                log.warning("Primary model unavailable; fallback model succeeded: %s", model_name)
+            return (response.choices[0].message.content or "").strip()[:MAX_REPLY_CHARS]
+        except NotFoundError as exc:
+            last_error = exc
+            log.warning("Groq model unavailable (model=%s); trying fallback if available", model_name)
+            continue
+    if last_error is not None:
+        log.exception("All configured Groq models are unavailable")
+        raise last_error
+    return ""
 
 
 async def process_event(event):
-    sender_id = event.sender_id
-    if not await enabled():
-        log.info("Incoming message ignored: AI is disabled (sender_id=%s)", sender_id)
+    if not await enabled() or not await is_allowed_and_consented(event.sender_id):
         return
-    if not await is_allowed_and_consented(sender_id):
-        log.info("Incoming message ignored: contact is not allowed/consented (sender_id=%s)", sender_id)
-        return
-
-    log.info("Generating reply immediately (sender_id=%s)", sender_id)
-    # Pass the event, not event.chat_id: the event contains the Telegram peer
-    # metadata needed by Telethon for a first-time conversation.
-    answer = await answer_with_ai(event)
+    answer = await answer_with_ai(event.chat_id)
     if answer:
         await event.respond(answer)
-        log.info("Reply sent successfully (sender_id=%s)", sender_id)
-    else:
-        log.warning("AI returned an empty reply (sender_id=%s)", sender_id)
 
 
 async def worker(user_id):
     q = queues[user_id]
     while not stopping:
         event = await q.get()
-        # No debounce: begin processing the first incoming message immediately.
-        # If more messages are already queued, process the newest event once;
-        # build_context() will include the recent conversation history.
+        await asyncio.sleep(DEBOUNCE_SECONDS)
         while True:
             try:
                 event = q.get_nowait()
@@ -762,44 +763,28 @@ async def worker(user_id):
 
 @user_client.on(events.NewMessage(incoming=True))
 async def on_new_message(event):
-    sender_id = event.sender_id
-    if not event.is_private or sender_id is None or not (event.raw_text or "").strip():
+    if not event.is_private or event.sender_id is None or not (event.raw_text or "").strip():
         return
-
-    log.info("Incoming private message received (sender_id=%s)", sender_id)
-
-    # Permission checks remain mandatory, but database timestamp persistence is
-    # moved off the critical path so it cannot delay the first reply.
-    if not await is_allowed_and_consented(sender_id):
-        log.info("Incoming message ignored: contact is not allowed/consented (sender_id=%s)", sender_id)
+    if not await is_allowed_and_consented(event.sender_id):
         return
+    try:
+        await update_contact_incoming(event.sender_id)
+    except Exception:
+        log.exception("Could not persist incoming timestamp for %s", event.sender_id)
+        # Fail closed for scheduler bookkeeping, but still queue normal reply.
     if not await enabled():
-        log.info("Incoming message received but AI is disabled (sender_id=%s)", sender_id)
         return
-
-    q = queues.get(sender_id)
+    q = queues.get(event.sender_id)
     if q is None:
         q = asyncio.Queue(maxsize=MAX_QUEUE_PER_USER)
-        queues[sender_id] = q
+        queues[event.sender_id] = q
     if q.full():
         with suppress(asyncio.QueueEmpty):
             q.get_nowait()
-        log.warning("Queue full; dropped oldest pending event (sender_id=%s)", sender_id)
     q.put_nowait(event)
-    log.info("Incoming message queued (sender_id=%s, queue_size=%s)", sender_id, q.qsize())
-
-    task = workers.get(sender_id)
+    task = workers.get(event.sender_id)
     if task is None or task.done():
-        workers[sender_id] = asyncio.create_task(worker(sender_id))
-
-    asyncio.create_task(update_contact_incoming_safely(sender_id))
-
-
-async def update_contact_incoming_safely(sender_id):
-    try:
-        await update_contact_incoming(sender_id)
-    except Exception:
-        log.exception("Could not persist incoming timestamp for %s", sender_id)
+        workers[event.sender_id] = asyncio.create_task(worker(event.sender_id))
 
 
 async def scheduler_loop():
@@ -912,30 +897,19 @@ async def initialize_settings():
 async def main():
     global stopping
     await initialize_settings()
-    log.info("Connecting Telethon user session...")
     await user_client.connect()
     if not await user_client.is_user_authorized():
         raise RuntimeError("TELEGRAM_SESSION недействительна. Создайте новую локально.")
-    me = await user_client.get_me()
-    log.info(
-        "Telegram user session connected (account_id=%s username=%s)",
-        getattr(me, "id", None),
-        getattr(me, "username", None),
-    )
-    telethon_updates_task = asyncio.create_task(
-        user_client.run_until_disconnected(), name="telethon-updates-loop"
-    )
+    log.info("Telegram user session connected")
     runner = await run_web()
-    scheduler_task = asyncio.create_task(scheduler_loop(), name="initiative-scheduler")
+    scheduler_task = asyncio.create_task(scheduler_loop())
     try:
         await dp.start_polling(bot)
     finally:
         stopping = True
-        for task in (scheduler_task, telethon_updates_task):
-            if not task.done():
-                task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        scheduler_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await scheduler_task
         for task in workers.values():
             task.cancel()
         for task in workers.values():
