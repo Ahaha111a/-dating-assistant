@@ -38,7 +38,7 @@ SUPABASE_URL = env("SUPABASE_URL")
 SUPABASE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
 
 AI_MODEL = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
-DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "1.5"))
+DEBOUNCE_SECONDS = 0.0  # No artificial wait before answering
 MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "3500"))
 CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "16"))
 MAX_QUEUE_PER_USER = int(os.getenv("MAX_QUEUE_PER_USER", "100"))
@@ -457,34 +457,6 @@ async def start_cmd(message: Message):
     await send_admin(message, await menu_text(), main_keyboard())
 
 
-@dp.message(Command("diag"))
-async def diag_cmd(message: Message):
-    if not is_admin(message):
-        return
-    try:
-        connected = user_client.is_connected()
-        authorized = await user_client.is_user_authorized() if connected else False
-        me = await user_client.get_me() if connected and authorized else None
-        rows = await get_allowed()
-        consented = sum(1 for row in rows if row.get("consented") is True)
-        await send_admin(
-            message,
-            "🔎 <b>Диагностика</b>\\n"
-            f"Telethon connected: <b>{connected}</b>\\n"
-            f"Telegram authorized: <b>{authorized}</b>\\n"
-            f"Аккаунт ID: <code>{getattr(me, 'id', '—')}</code>\\n"
-            f"Автоответы включены: <b>{await enabled()}</b>\\n"
-            f"Разрешённых контактов: <b>{len(rows)}</b>\\n"
-            f"С подтверждённым согласием: <b>{consented}</b>\\n"
-            f"Активных обработчиков: <b>{sum(1 for task in workers.values() if not task.done())}</b>\\n"
-            "Теперь попроси разрешённый контакт отправить обычное текстовое сообщение и проверь Railway Logs на строку "
-            "<code>Telethon incoming update received</code>."
-        )
-    except Exception:
-        log.exception("Diagnostic command failed")
-        await send_admin(message, "Диагностика завершилась ошибкой. Подробности смотри в Railway Logs.")
-
-
 @dp.message(Command("status"))
 async def status_cmd(message: Message):
     if not is_admin(message):
@@ -736,81 +708,60 @@ async def answer_with_ai(chat_id, extra_instruction=None):
 async def process_event(event):
     sender_id = event.sender_id
     if not await enabled():
-        log.info("Incoming message ignored: AI is disabled (sender_id=%s)", sender_id)
+        log.info("Incoming message ignored: AI disabled (sender_id=%s)", sender_id)
         return
     if not await is_allowed_and_consented(sender_id):
-        log.info("Incoming message ignored: contact is not allowed/consented (sender_id=%s)", sender_id)
+        log.info("Incoming message ignored: contact not allowed/consented (sender_id=%s)", sender_id)
         return
-
-    log.info("Generating reply for sender_id=%s", sender_id)
+    log.info("Generating immediate reply (sender_id=%s)", sender_id)
     answer = await answer_with_ai(event.chat_id)
-    if not answer:
-        log.warning("AI returned an empty reply (sender_id=%s)", sender_id)
-        return
-    await event.respond(answer)
-    log.info("Reply sent successfully (sender_id=%s)", sender_id)
+    if answer:
+        await event.respond(answer)
+        log.info("Reply sent (sender_id=%s)", sender_id)
+    else:
+        log.warning("AI returned empty reply (sender_id=%s)", sender_id)
 
 
 async def worker(user_id):
     q = queues[user_id]
     while not stopping:
         event = await q.get()
-        await asyncio.sleep(DEBOUNCE_SECONDS)
+        # Do not debounce: start generating the reply immediately.
+        # If several messages arrived in the same event-loop tick, use the newest
+        # event; build_context() will include the complete recent Telegram history.
         while True:
             try:
                 event = q.get_nowait()
             except asyncio.QueueEmpty:
                 break
         try:
-            log.info("Processing queued incoming message (sender_id=%s)", user_id)
             await process_event(event)
         except FloodWaitError as exc:
             delay = max(1, int(exc.seconds))
-            log.warning("Telegram rate limit: wait %s seconds (sender_id=%s)", delay, user_id)
+            log.warning("Telegram rate limit: wait %s seconds", delay)
             await asyncio.sleep(delay)
-            try:
+            with suppress(Exception):
                 await process_event(event)
-            except Exception:
-                log.exception("Retry after FloodWait failed (sender_id=%s)", user_id)
-        except Exception:
-            log.exception("Message processing failed (sender_id=%s)", user_id)
+        except Exception as exc:
+            log.exception("Message processing failed for %s: %s", user_id, type(exc).__name__)
 
 
 @user_client.on(events.NewMessage(incoming=True))
 async def on_new_message(event):
-    # Не записываем текст переписки в логи: только технические метаданные.
     sender_id = event.sender_id
-    text_present = bool((event.raw_text or "").strip())
-    log.info(
-        "Telethon incoming update received: sender_id=%s chat_id=%s private=%s text_present=%s",
-        sender_id, event.chat_id, event.is_private, text_present
-    )
-
-    if not event.is_private:
-        log.debug("Incoming update ignored: not a private chat")
+    if not event.is_private or sender_id is None or not (event.raw_text or "").strip():
         return
-    if sender_id is None or not text_present:
-        log.info("Incoming update ignored: missing sender or text")
-        return
+    log.info("Incoming private message update received (sender_id=%s)", sender_id)
 
-    try:
-        allowed = await is_allowed_and_consented(sender_id)
-    except Exception:
-        log.exception("Could not check contact permission (sender_id=%s)", sender_id)
+    if not await is_allowed_and_consented(sender_id):
+        log.info("Incoming message ignored: contact not allowed/consented (sender_id=%s)", sender_id)
         return
-    if not allowed:
-        log.info("Incoming update ignored: contact is not allowed/consented (sender_id=%s)", sender_id)
-        return
-
-    try:
-        await update_contact_incoming(sender_id)
-    except Exception:
-        log.exception("Could not persist incoming timestamp for %s", sender_id)
-
     if not await enabled():
-        log.info("Incoming message received but AI is disabled (sender_id=%s)", sender_id)
+        log.info("Incoming message ignored: AI disabled (sender_id=%s)", sender_id)
         return
 
+    # Queue immediately; persist scheduler timestamp in the background so Supabase
+    # latency does not delay the conversational reply.
     q = queues.get(sender_id)
     if q is None:
         q = asyncio.Queue(maxsize=MAX_QUEUE_PER_USER)
@@ -818,14 +769,21 @@ async def on_new_message(event):
     if q.full():
         with suppress(asyncio.QueueEmpty):
             q.get_nowait()
-        log.warning("Per-contact queue was full; dropped oldest pending event (sender_id=%s)", sender_id)
     q.put_nowait(event)
-    log.info("Incoming message queued (sender_id=%s, queue_size=%s)", sender_id, q.qsize())
+    log.info("Incoming message queued immediately (sender_id=%s, queue_size=%s)", sender_id, q.qsize())
 
     task = workers.get(sender_id)
     if task is None or task.done():
         workers[sender_id] = asyncio.create_task(worker(sender_id))
-        log.info("Reply worker started (sender_id=%s)", sender_id)
+
+    asyncio.create_task(update_contact_incoming_safely(sender_id))
+
+
+async def update_contact_incoming_safely(sender_id):
+    try:
+        await update_contact_incoming(sender_id)
+    except Exception:
+        log.exception("Could not persist incoming timestamp for %s", sender_id)
 
 
 async def scheduler_loop():
@@ -896,15 +854,11 @@ async def scheduler_loop():
 
 async def health(request):
     try:
-        connected = user_client.is_connected()
-        authorized = await user_client.is_user_authorized() if connected else False
         return web.json_response({
             "status": "ok",
-            "telegram_connected": connected,
-            "telegram_authorized": authorized,
+            "telegram_connected": user_client.is_connected(),
             "enabled": await enabled(),
             "initiative_enabled": await initiative_enabled(),
-            "active_workers": sum(1 for task in workers.values() if not task.done()),
         })
     except Exception as exc:
         log.exception("Health check failed")
@@ -942,28 +896,17 @@ async def initialize_settings():
 async def main():
     global stopping
     await initialize_settings()
-
     log.info("Connecting Telethon user session...")
     await user_client.connect()
     if not await user_client.is_user_authorized():
         raise RuntimeError("TELEGRAM_SESSION недействительна. Создайте новую локально.")
-
     me = await user_client.get_me()
-    log.info(
-        "Telethon user session connected: account_id=%s username=%s",
-        getattr(me, "id", None),
-        getattr(me, "username", None),
-    )
-
-    # Явно держим цикл обновлений Telethon активным параллельно с polling aiogram.
-    # Это также даёт понятный лог при неожиданном отключении пользовательской сессии.
+    log.info("Telegram user session connected (account_id=%s)", getattr(me, "id", None))
     telethon_updates_task = asyncio.create_task(
-        user_client.run_until_disconnected(),
-        name="telethon-updates-loop",
+        user_client.run_until_disconnected(), name="telethon-updates-loop"
     )
     runner = await run_web()
-    scheduler_task = asyncio.create_task(scheduler_loop(), name="initiative-scheduler")
-
+    scheduler_task = asyncio.create_task(scheduler_loop())
     try:
         await dp.start_polling(bot)
     finally:
@@ -973,13 +916,11 @@ async def main():
                 task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
-
         for task in workers.values():
             task.cancel()
         for task in workers.values():
             with suppress(asyncio.CancelledError):
                 await task
-
         await runner.cleanup()
         await user_client.disconnect()
         await bot.session.close()
