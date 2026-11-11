@@ -44,3 +44,13 @@ values
     ('initiative_enabled', 'true'),
     ('initiative_hours', '6')
 on conflict (key) do nothing;
+
+
+-- Distributed singleton lease: blocks simultaneous bot polling across replicas.
+create table if not exists public.operator_runtime_lock (
+    lock_name text primary key,
+    owner_id text not null,
+    lease_until timestamptz not null,
+    updated_at timestamptz not null default now()
+);
+alter table public.operator_runtime_lock enable row level security;
