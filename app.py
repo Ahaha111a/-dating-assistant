@@ -182,6 +182,11 @@ dp = Dispatcher()
 llm = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 user_client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
 
+# IDs are resolved at startup. The control bot must never be treated as a
+# human conversation partner by the user-account message handler.
+CONTROL_BOT_ID = None
+TELETHON_ACCOUNT_ID = None
+
 queues = {}
 workers = {}
 admin_pending = {}
@@ -541,6 +546,29 @@ async def start_cmd(message: Message):
     await send_admin(message, await menu_text(), main_keyboard())
 
 
+@dp.message(Command("session"))
+async def session_cmd(message: Message):
+    if not is_admin(message):
+        return
+    try:
+        control_bot = await bot.get_me()
+        if not user_client.is_connected():
+            await send_admin(message, "Пользовательская Telegram-сессия сейчас не подключена.")
+            return
+        account = await user_client.get_me()
+        await send_admin(
+            message,
+            "Диагностика аккаунтов:\\n"
+            f"Управляющий бот: @{getattr(control_bot, 'username', 'unknown')} (ID <code>{control_bot.id}</code>)\\n"
+            f"Личный аккаунт Telethon: @{getattr(account, 'username', 'без_username')} "
+            f"(ID <code>{account.id}</code>)\\n\\n"
+            "Именно на личный аккаунт Telethon должны приходить сообщения собеседников."
+        )
+    except Exception as exc:
+        log.exception("Session diagnostics failed")
+        await send_admin(message, f"Ошибка диагностики: {type(exc).__name__}")
+
+
 @dp.message(Command("status"))
 async def status_cmd(message: Message):
     if not is_admin(message):
@@ -851,7 +879,20 @@ async def on_new_message(event):
     sender_id = event.sender_id
     if not event.is_private or sender_id is None or not (event.raw_text or "").strip():
         return
-    log.info("Incoming private message received (sender_id=%s)", sender_id)
+
+    # Ignore messages from our own account and the separate management bot.
+    # The bot's private chat is an admin/control channel, not a customer dialog.
+    if TELETHON_ACCOUNT_ID is not None and int(sender_id) == int(TELETHON_ACCOUNT_ID):
+        log.info("Incoming update ignored: message from own Telegram account (sender_id=%s)", sender_id)
+        return
+    if CONTROL_BOT_ID is not None and int(sender_id) == int(CONTROL_BOT_ID):
+        log.info("Incoming update ignored: message from control bot (sender_id=%s)", sender_id)
+        return
+
+    log.info(
+        "Incoming private message received (sender_id=%s chat_id=%s account_id=%s)",
+        sender_id, event.chat_id, TELETHON_ACCOUNT_ID
+    )
     try:
         if not await is_allowed_and_consented(sender_id):
             log.info("Incoming update ignored: contact not allowed/consented (sender_id=%s)", sender_id)
@@ -990,7 +1031,7 @@ async def initialize_settings():
 
 
 async def main():
-    global stopping, lease_task
+    global stopping, lease_task, CONTROL_BOT_ID, TELETHON_ACCOUNT_ID
     runner = None
     scheduler_task = None
     telethon_task = None
@@ -1001,12 +1042,29 @@ async def main():
         await initialize_settings()
         await acquire_instance_lease()
         lease_acquired = True
+
+        control_bot = await bot.get_me()
+        CONTROL_BOT_ID = int(control_bot.id)
+        log.info(
+            "Control bot identity: id=%s username=@%s",
+            CONTROL_BOT_ID, getattr(control_bot, "username", None)
+        )
+
         log.info("Connecting Telethon user session...")
         await user_client.connect()
         if not await user_client.is_user_authorized():
             raise RuntimeError("TELEGRAM_SESSION недействительна. Создай новую сессию и обнови переменную Railway.")
         me = await user_client.get_me()
-        log.info("Telethon connected (account_id=%s username=%s)", getattr(me, "id", None), getattr(me, "username", None))
+        TELETHON_ACCOUNT_ID = int(me.id)
+        log.info(
+            "Telethon connected (account_id=%s username=@%s; control_bot_id=%s)",
+            TELETHON_ACCOUNT_ID, getattr(me, "username", None), CONTROL_BOT_ID
+        )
+        if TELETHON_ACCOUNT_ID == CONTROL_BOT_ID:
+            raise RuntimeError(
+                "TELEGRAM_SESSION авторизована не как личный пользовательский аккаунт. "
+                "Нужна StringSession обычного Telegram-аккаунта, не управляющего бота."
+            )
         telethon_task = asyncio.create_task(user_client.run_until_disconnected(), name="telethon-updates")
         scheduler_task = asyncio.create_task(scheduler_loop(), name="initiative-scheduler")
         lease_task = asyncio.create_task(renew_instance_lease(), name="singleton-lease-renewal")
