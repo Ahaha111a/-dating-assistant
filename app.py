@@ -38,7 +38,7 @@ SUPABASE_URL = env("SUPABASE_URL")
 SUPABASE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
 
 AI_MODEL = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
-DEBOUNCE_SECONDS = 0.0  # No artificial wait before answering
+DEBOUNCE_SECONDS = 0.0  # Immediate processing; no intentional debounce
 MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "3500"))
 CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "16"))
 MAX_QUEUE_PER_USER = int(os.getenv("MAX_QUEUE_PER_USER", "100"))
@@ -676,8 +676,19 @@ async def menu_and_text_handler(message: Message):
         await send_admin(message, await menu_text(), main_keyboard())
 
 
-async def build_context(chat_id):
-    messages = await user_client.get_messages(chat_id, limit=CONTEXT_MESSAGES)
+async def build_context(target):
+    """
+    Build context using a Telethon event when replying to an incoming message.
+    An event carries peer information from the live update, which is essential
+    for a contact whose entity has not yet been cached in the session.
+    """
+    if hasattr(target, "get_input_chat"):
+        entity = await target.get_input_chat()
+    else:
+        # Scheduled messages have no live event; resolve the saved user ID.
+        entity = await user_client.get_entity(target)
+
+    messages = await user_client.get_messages(entity, limit=CONTEXT_MESSAGES)
     context = []
     for item in reversed(messages):
         if item.message:
@@ -688,8 +699,8 @@ async def build_context(chat_id):
     return context
 
 
-async def answer_with_ai(chat_id, extra_instruction=None):
-    context = await build_context(chat_id)
+async def answer_with_ai(target, extra_instruction=None):
+    context = await build_context(target)
     if not context:
         return ""
     system = await system_prompt()
@@ -708,27 +719,30 @@ async def answer_with_ai(chat_id, extra_instruction=None):
 async def process_event(event):
     sender_id = event.sender_id
     if not await enabled():
-        log.info("Incoming message ignored: AI disabled (sender_id=%s)", sender_id)
+        log.info("Incoming message ignored: AI is disabled (sender_id=%s)", sender_id)
         return
     if not await is_allowed_and_consented(sender_id):
-        log.info("Incoming message ignored: contact not allowed/consented (sender_id=%s)", sender_id)
+        log.info("Incoming message ignored: contact is not allowed/consented (sender_id=%s)", sender_id)
         return
-    log.info("Generating immediate reply (sender_id=%s)", sender_id)
-    answer = await answer_with_ai(event.chat_id)
+
+    log.info("Generating reply immediately (sender_id=%s)", sender_id)
+    # Pass the event, not event.chat_id: the event contains the Telegram peer
+    # metadata needed by Telethon for a first-time conversation.
+    answer = await answer_with_ai(event)
     if answer:
         await event.respond(answer)
-        log.info("Reply sent (sender_id=%s)", sender_id)
+        log.info("Reply sent successfully (sender_id=%s)", sender_id)
     else:
-        log.warning("AI returned empty reply (sender_id=%s)", sender_id)
+        log.warning("AI returned an empty reply (sender_id=%s)", sender_id)
 
 
 async def worker(user_id):
     q = queues[user_id]
     while not stopping:
         event = await q.get()
-        # Do not debounce: start generating the reply immediately.
-        # If several messages arrived in the same event-loop tick, use the newest
-        # event; build_context() will include the complete recent Telegram history.
+        # No debounce: begin processing the first incoming message immediately.
+        # If more messages are already queued, process the newest event once;
+        # build_context() will include the recent conversation history.
         while True:
             try:
                 event = q.get_nowait()
@@ -751,17 +765,18 @@ async def on_new_message(event):
     sender_id = event.sender_id
     if not event.is_private or sender_id is None or not (event.raw_text or "").strip():
         return
-    log.info("Incoming private message update received (sender_id=%s)", sender_id)
 
+    log.info("Incoming private message received (sender_id=%s)", sender_id)
+
+    # Permission checks remain mandatory, but database timestamp persistence is
+    # moved off the critical path so it cannot delay the first reply.
     if not await is_allowed_and_consented(sender_id):
-        log.info("Incoming message ignored: contact not allowed/consented (sender_id=%s)", sender_id)
+        log.info("Incoming message ignored: contact is not allowed/consented (sender_id=%s)", sender_id)
         return
     if not await enabled():
-        log.info("Incoming message ignored: AI disabled (sender_id=%s)", sender_id)
+        log.info("Incoming message received but AI is disabled (sender_id=%s)", sender_id)
         return
 
-    # Queue immediately; persist scheduler timestamp in the background so Supabase
-    # latency does not delay the conversational reply.
     q = queues.get(sender_id)
     if q is None:
         q = asyncio.Queue(maxsize=MAX_QUEUE_PER_USER)
@@ -769,8 +784,9 @@ async def on_new_message(event):
     if q.full():
         with suppress(asyncio.QueueEmpty):
             q.get_nowait()
+        log.warning("Queue full; dropped oldest pending event (sender_id=%s)", sender_id)
     q.put_nowait(event)
-    log.info("Incoming message queued immediately (sender_id=%s, queue_size=%s)", sender_id, q.qsize())
+    log.info("Incoming message queued (sender_id=%s, queue_size=%s)", sender_id, q.qsize())
 
     task = workers.get(sender_id)
     if task is None or task.done():
@@ -901,12 +917,16 @@ async def main():
     if not await user_client.is_user_authorized():
         raise RuntimeError("TELEGRAM_SESSION недействительна. Создайте новую локально.")
     me = await user_client.get_me()
-    log.info("Telegram user session connected (account_id=%s)", getattr(me, "id", None))
+    log.info(
+        "Telegram user session connected (account_id=%s username=%s)",
+        getattr(me, "id", None),
+        getattr(me, "username", None),
+    )
     telethon_updates_task = asyncio.create_task(
         user_client.run_until_disconnected(), name="telethon-updates-loop"
     )
     runner = await run_web()
-    scheduler_task = asyncio.create_task(scheduler_loop())
+    scheduler_task = asyncio.create_task(scheduler_loop(), name="initiative-scheduler")
     try:
         await dp.start_polling(bot)
     finally:
