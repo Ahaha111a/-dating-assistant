@@ -46,7 +46,7 @@ values
 on conflict (key) do nothing;
 
 
--- Distributed singleton lease: blocks simultaneous bot polling across replicas.
+-- Singleton lease via atomic PostgreSQL RPC (no PostgREST update().select()).
 create table if not exists public.operator_runtime_lock (
     lock_name text primary key,
     owner_id text not null,
@@ -54,3 +54,73 @@ create table if not exists public.operator_runtime_lock (
     updated_at timestamptz not null default now()
 );
 alter table public.operator_runtime_lock enable row level security;
+
+create or replace function public.claim_operator_runtime_lock(
+    p_owner_id text,
+    p_lease_seconds integer default 120
+) returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    affected integer;
+begin
+    insert into public.operator_runtime_lock(lock_name, owner_id, lease_until, updated_at)
+    values ('telegram-ai-operator', p_owner_id, now() + make_interval(secs => greatest(p_lease_seconds, 30)), now())
+    on conflict (lock_name) do update
+       set owner_id = excluded.owner_id,
+           lease_until = excluded.lease_until,
+           updated_at = now()
+     where public.operator_runtime_lock.lease_until < now()
+        or public.operator_runtime_lock.owner_id = excluded.owner_id;
+    get diagnostics affected = row_count;
+    return affected = 1;
+end;
+$$;
+
+create or replace function public.renew_operator_runtime_lock(
+    p_owner_id text,
+    p_lease_seconds integer default 120
+) returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    affected integer;
+begin
+    update public.operator_runtime_lock
+       set lease_until = now() + make_interval(secs => greatest(p_lease_seconds, 30)),
+           updated_at = now()
+     where lock_name = 'telegram-ai-operator'
+       and owner_id = p_owner_id
+       and lease_until > now();
+    get diagnostics affected = row_count;
+    return affected = 1;
+end;
+$$;
+
+create or replace function public.release_operator_runtime_lock(p_owner_id text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    affected integer;
+begin
+    delete from public.operator_runtime_lock
+     where lock_name = 'telegram-ai-operator' and owner_id = p_owner_id;
+    get diagnostics affected = row_count;
+    return affected = 1;
+end;
+$$;
+
+revoke all on function public.claim_operator_runtime_lock(text, integer) from public, anon, authenticated;
+revoke all on function public.renew_operator_runtime_lock(text, integer) from public, anon, authenticated;
+revoke all on function public.release_operator_runtime_lock(text) from public, anon, authenticated;
+grant execute on function public.claim_operator_runtime_lock(text, integer) to service_role;
+grant execute on function public.renew_operator_runtime_lock(text, integer) to service_role;
+grant execute on function public.release_operator_runtime_lock(text) to service_role;
+notify pgrst, 'reload schema';
