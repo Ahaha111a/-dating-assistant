@@ -40,15 +40,8 @@ SUPABASE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
 
 # Быстрая модель по умолчанию. Можно переопределить через Railway AI_MODEL.
 AI_MODEL = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
-AI_MODEL_FALLBACKS = [
-    model.strip()
-    for model in os.getenv(
-        "AI_MODEL_FALLBACKS",
-        "openai/gpt-oss-20b"
-    ).split(",")
-    if model.strip()
-]
-DEBOUNCE_SECONDS = 0.0  # no artificial debounce; reply starts on first update
+AI_MODEL_FALLBACKS = [model.strip() for model in os.getenv("AI_MODEL_FALLBACKS", "openai/gpt-oss-20b").split(",") if model.strip()]
+DEBOUNCE_SECONDS = 0.0  # respond without artificial delay
 MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "3500"))
 CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "16"))
 MAX_QUEUE_PER_USER = int(os.getenv("MAX_QUEUE_PER_USER", "100"))
@@ -195,69 +188,86 @@ admin_pending = {}
 stopping = False
 scheduler_lock = asyncio.Lock()
 
-# A database-backed lease prevents two Railway replicas/deployments from polling
-# the same Telegram bot token at the same time.
-INSTANCE_ID = f"{os.getenv('RAILWAY_REPLICA_ID', 'replica')}:{uuid.uuid4().hex}"
-INSTANCE_LEASE_SECONDS = 120
-instance_lease_task = None
+# A Supabase RPC-backed lease is the single source of truth across Railway replicas.
+INSTANCE_ID = f"{os.getenv('RAILWAY_REPLICA_ID', 'railway')}:{uuid.uuid4().hex}"
+LEASE_SECONDS = 120
+lease_task = None
 
 
-def _claim_instance_lease():
-    now = now_utc()
-    until = now + timedelta(seconds=INSTANCE_LEASE_SECONDS)
-    payload = {
-        "lock_name": "telegram-ai-operator",
-        "owner_id": INSTANCE_ID,
-        "lease_until": iso(until),
-        "updated_at": iso(now),
-    }
-    try:
-        db.table("operator_runtime_lock").insert(payload).execute()
-        return True
-    except Exception:
-        # Existing lease: take over only if it has expired. The conditional
-        # UPDATE is atomic at Postgres level, so only one replica can win.
-        result = db.table("operator_runtime_lock").update({
-            "owner_id": INSTANCE_ID,
-            "lease_until": iso(until),
-            "updated_at": iso(now),
-        }).eq("lock_name", "telegram-ai-operator").lt(
-            "lease_until", iso(now)
-        ).select("owner_id").execute()
-        return bool(result.data and result.data[0].get("owner_id") == INSTANCE_ID)
+def _rpc_result_bool(result):
+    value = getattr(result, "data", None)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, list) and value:
+        first = value[0]
+        if isinstance(first, bool):
+            return first
+        if isinstance(first, dict):
+            return bool(next(iter(first.values()), False))
+    if isinstance(value, dict):
+        return bool(next(iter(value.values()), False))
+    return bool(value)
+
+
+def _claim_lease():
+    result = db.rpc("claim_operator_runtime_lock", {
+        "p_owner_id": INSTANCE_ID,
+        "p_lease_seconds": LEASE_SECONDS,
+    }).execute()
+    return _rpc_result_bool(result)
 
 
 async def acquire_instance_lease():
-    ok = await asyncio.to_thread(_claim_instance_lease)
+    try:
+        ok = await asyncio.to_thread(_claim_lease)
+    except Exception as exc:
+        log.exception("Could not claim singleton lease. Check that latest database/schema.sql was executed and Supabase RPC is available.")
+        raise RuntimeError(
+            "Не удалось получить блокировку запуска. Выполни обновлённый database/schema.sql в Supabase и проверь SUPABASE_SERVICE_ROLE_KEY."
+        ) from exc
     if not ok:
         raise RuntimeError(
-            "Другой экземпляр уже владеет Telegram polling lock. "
-            "Оставьте одну Railway Replica/один активный сервис."
+            "Другой экземпляр уже запущен с этим BOT_TOKEN. Оставь одну Railway Replica и останови дублирующие сервисы."
         )
-    log.info("Instance lease acquired (instance_id=%s)", INSTANCE_ID)
+    log.info("Singleton lease acquired (instance_id=%s)", INSTANCE_ID)
+
+
+def _renew_lease():
+    result = db.rpc("renew_operator_runtime_lock", {
+        "p_owner_id": INSTANCE_ID,
+        "p_lease_seconds": LEASE_SECONDS,
+    }).execute()
+    return _rpc_result_bool(result)
 
 
 async def renew_instance_lease():
+    global stopping
     while not stopping:
         await asyncio.sleep(30)
-        now = now_utc()
-        until = now + timedelta(seconds=INSTANCE_LEASE_SECONDS)
-        def renew():
-            result = db.table("operator_runtime_lock").update({
-                "lease_until": iso(until),
-                "updated_at": iso(now),
-            }).eq("lock_name", "telegram-ai-operator").eq(
-                "owner_id", INSTANCE_ID
-            ).select("owner_id").execute()
-            return bool(result.data)
-        if not await asyncio.to_thread(renew):
-            raise RuntimeError("Lost Telegram polling instance lease; stopping to avoid duplicate polling")
+        try:
+            ok = await asyncio.to_thread(_renew_lease)
+        except Exception:
+            log.exception("Singleton lease renewal failed; stopping polling to avoid duplicate bot instances")
+            stopping = True
+            asyncio.create_task(dp.stop_polling())
+            return
+        if not ok:
+            log.error("Singleton lease ownership lost; stopping polling immediately")
+            stopping = True
+            asyncio.create_task(dp.stop_polling())
+            return
+
+
+def _release_lease():
+    db.rpc("release_operator_runtime_lock", {"p_owner_id": INSTANCE_ID}).execute()
 
 
 async def release_instance_lease():
-    await asyncio.to_thread(lambda: db.table("operator_runtime_lock").delete().eq(
-        "lock_name", "telegram-ai-operator"
-    ).eq("owner_id", INSTANCE_ID).execute())
+    try:
+        await asyncio.to_thread(_release_lease)
+        log.info("Singleton lease released")
+    except Exception:
+        log.exception("Could not release singleton lease; it will expire automatically")
 
 
 def now_utc():
@@ -751,7 +761,8 @@ async def menu_and_text_handler(message: Message):
 
 
 async def build_context(target):
-    # Live events carry the peer/access-hash needed for first-time contacts.
+    # The live event contains an InputPeer with access_hash. A bare numeric ID
+    # is insufficient for a first-time private contact in Telethon.
     if hasattr(target, "get_input_chat"):
         entity = await target.get_input_chat()
     else:
@@ -804,31 +815,25 @@ async def answer_with_ai(target, extra_instruction=None):
 async def process_event(event):
     sender_id = event.sender_id
     if not await enabled():
-        log.info("Incoming update ignored: AI disabled (sender_id=%s)", sender_id)
+        log.info("Incoming update ignored: operator disabled (sender_id=%s)", sender_id)
         return
     if not await is_allowed_and_consented(sender_id):
         log.info("Incoming update ignored: contact not allowed/consented (sender_id=%s)", sender_id)
         return
-    log.info("Generating reply (sender_id=%s)", sender_id)
+    log.info("Generating AI reply (sender_id=%s)", sender_id)
     answer = await answer_with_ai(event)
     if answer:
         await event.respond(answer)
-        log.info("Reply sent (sender_id=%s)", sender_id)
+        log.info("AI reply sent (sender_id=%s)", sender_id)
     else:
-        log.warning("AI returned empty response (sender_id=%s)", sender_id)
+        log.warning("AI returned empty reply (sender_id=%s)", sender_id)
 
 
 async def worker(user_id):
     q = queues[user_id]
     while not stopping:
         event = await q.get()
-        # No artificial debounce: process the first incoming message immediately.
-        while True:
-            try:
-                newer_event = q.get_nowait()
-                event = newer_event
-            except asyncio.QueueEmpty:
-                break
+        # Immediate processing; no fixed debounce delay.
         try:
             await process_event(event)
         except FloodWaitError as exc:
@@ -852,7 +857,7 @@ async def on_new_message(event):
             log.info("Incoming update ignored: contact not allowed/consented (sender_id=%s)", sender_id)
             return
         if not await enabled():
-            log.info("Incoming update ignored: AI disabled (sender_id=%s)", sender_id)
+            log.info("Incoming update ignored: operator disabled (sender_id=%s)", sender_id)
             return
         q = queues.get(sender_id)
         if q is None:
@@ -948,7 +953,6 @@ async def health(request):
         return web.json_response({
             "status": "ok",
             "telegram_connected": user_client.is_connected(),
-            "instance_id": INSTANCE_ID,
             "enabled": await enabled(),
             "initiative_enabled": await initiative_enabled(),
         })
@@ -986,48 +990,51 @@ async def initialize_settings():
 
 
 async def main():
-    global stopping, instance_lease_task
-    await acquire_instance_lease()
+    global stopping, lease_task
+    runner = None
+    scheduler_task = None
+    telethon_task = None
+    lease_task = None
+    lease_acquired = False
     try:
+        runner = await run_web()
         await initialize_settings()
+        await acquire_instance_lease()
+        lease_acquired = True
         log.info("Connecting Telethon user session...")
         await user_client.connect()
         if not await user_client.is_user_authorized():
-            raise RuntimeError("TELEGRAM_SESSION недействительна. Создайте новую локально.")
+            raise RuntimeError("TELEGRAM_SESSION недействительна. Создай новую сессию и обнови переменную Railway.")
         me = await user_client.get_me()
-        log.info(
-            "Telegram user session connected (account_id=%s username=%s)",
-            getattr(me, "id", None), getattr(me, "username", None)
-        )
-        telethon_updates_task = asyncio.create_task(
-            user_client.run_until_disconnected(), name="telethon-updates-loop"
-        )
-        runner = await run_web()
+        log.info("Telethon connected (account_id=%s username=%s)", getattr(me, "id", None), getattr(me, "username", None))
+        telethon_task = asyncio.create_task(user_client.run_until_disconnected(), name="telethon-updates")
         scheduler_task = asyncio.create_task(scheduler_loop(), name="initiative-scheduler")
-        instance_lease_task = asyncio.create_task(
-            renew_instance_lease(), name="instance-lease-renewal"
-        )
-        try:
-            await dp.start_polling(bot, handle_signals=False)
-        finally:
-            stopping = True
-            for task in (scheduler_task, telethon_updates_task, instance_lease_task):
-                if task and not task.done():
-                    task.cancel()
-                if task:
-                    with suppress(asyncio.CancelledError, Exception):
-                        await task
-            for task in workers.values():
-                task.cancel()
-            for task in workers.values():
-                with suppress(asyncio.CancelledError):
-                    await task
-            await runner.cleanup()
-            await user_client.disconnect()
-            await bot.session.close()
+        lease_task = asyncio.create_task(renew_instance_lease(), name="singleton-lease-renewal")
+        log.info("Starting aiogram polling (single instance)")
+        await dp.start_polling(bot, handle_signals=False)
+    except Exception:
+        log.exception("Application startup/runtime failed")
+        raise
     finally:
         stopping = True
+        for task in (scheduler_task, lease_task, telethon_task):
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+        for task in list(workers.values()):
+            task.cancel()
+        for task in list(workers.values()):
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        if runner:
+            with suppress(Exception):
+                await runner.cleanup()
         with suppress(Exception):
+            await user_client.disconnect()
+        with suppress(Exception):
+            await bot.session.close()
+        if lease_acquired:
             await release_instance_lease()
 
 
