@@ -124,3 +124,47 @@ grant execute on function public.claim_operator_runtime_lock(text, integer) to s
 grant execute on function public.renew_operator_runtime_lock(text, integer) to service_role;
 grant execute on function public.release_operator_runtime_lock(text) to service_role;
 notify pgrst, 'reload schema';
+
+
+-- Aggregate operational statistics (message contents are never stored).
+create table if not exists public.operator_stats (
+    event_type text primary key,
+    count bigint not null default 0,
+    updated_at timestamptz not null default now()
+);
+alter table public.operator_stats enable row level security;
+
+create or replace function public.increment_operator_stat(
+    p_event_type text,
+    p_telegram_user_id bigint default null
+) returns bigint
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare new_count bigint;
+begin
+    insert into public.operator_stats(event_type, count, updated_at)
+    values (p_event_type, 1, now())
+    on conflict (event_type) do update
+      set count = public.operator_stats.count + 1,
+          updated_at = now()
+    returning count into new_count;
+    return new_count;
+end;
+$$;
+revoke all on function public.increment_operator_stat(text, bigint) from public, anon, authenticated;
+grant execute on function public.increment_operator_stat(text, bigint) to service_role;
+notify pgrst, 'reload schema';
+
+
+-- Compact per-contact memory: no raw chat history is copied into this table.
+create table if not exists public.operator_contact_memory (
+    telegram_user_id bigint primary key,
+    summary text not null default '',
+    interaction_count integer not null default 0,
+    updated_at timestamptz not null default now()
+);
+alter table public.operator_contact_memory enable row level security;
+
+notify pgrst, 'reload schema';
