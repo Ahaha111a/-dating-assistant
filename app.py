@@ -52,7 +52,7 @@ MULTIPART_DELAY_MIN = 4.0
 MULTIPART_DELAY_MAX = 10.0
 MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "3500"))
 CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "30"))
-MAX_QUEUE_PER_USER = int(os.getenv("MAX_QUEUE_PER_USER", "100"))
+MAX_QUEUE_PER_USER = int(os.getenv("MAX_QUEUE_PER_USER", "0"))  # 0 = без ограничения, чтобы не терять входящие сообщения
 SCHEDULER_INTERVAL_SECONDS = int(os.getenv("SCHEDULER_INTERVAL_SECONDS", "60"))
 DEFAULT_INITIATIVE_HOURS = 6
 MIN_INITIATIVE_GAP_HOURS = 24
@@ -232,46 +232,18 @@ def _claim_lease():
 
 
 async def acquire_instance_lease():
-    # Railway may briefly run the previous deployment while the new one starts.
-    # Never steal a still-valid lease; wait for the old process to release it or
-    # for its lease to expire. The SQL claim RPC remains the atomic authority.
-    max_attempts = 30
-    retry_delay = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            ok = await asyncio.to_thread(_claim_lease)
-        except Exception as exc:
-            log.exception(
-                "Singleton lease RPC failed (attempt %s/%s). "
-                "Check Supabase connectivity, claim_operator_runtime_lock RPC "
-                "and SUPABASE_SERVICE_ROLE_KEY.",
-                attempt, max_attempts,
-            )
-            raise RuntimeError(
-                "Не удалось связаться с механизмом блокировки Supabase. "
-                "Проверь SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY и RPC-функцию."
-            ) from exc
-
-        if ok:
-            log.info(
-                "Singleton lease acquired (instance_id=%s, attempt=%s)",
-                INSTANCE_ID, attempt,
-            )
-            return
-
-        if attempt < max_attempts:
-            log.warning(
-                "Singleton lease is currently held by another process; "
-                "waiting %ss before retry (%s/%s).",
-                retry_delay, attempt, max_attempts,
-            )
-            await asyncio.sleep(retry_delay)
-
-    raise RuntimeError(
-        "Не удалось получить блокировку за 150 секунд: предыдущий экземпляр "
-        "всё ещё удерживает действующую lease. Проверь Railway Deployments "
-        "и логи старого процесса; защита от одновременного запуска сохранена."
-    )
+    try:
+        ok = await asyncio.to_thread(_claim_lease)
+    except Exception as exc:
+        log.exception("Could not claim singleton lease. Check that latest database/schema.sql was executed and Supabase RPC is available.")
+        raise RuntimeError(
+            "Не удалось получить блокировку запуска. Выполни обновлённый database/schema.sql в Supabase и проверь SUPABASE_SERVICE_ROLE_KEY."
+        ) from exc
+    if not ok:
+        raise RuntimeError(
+            "Другой экземпляр уже запущен с этим BOT_TOKEN. Оставь одну Railway Replica и останови дублирующие сервисы."
+        )
+    log.info("Singleton lease acquired (instance_id=%s)", INSTANCE_ID)
 
 
 def _renew_lease():
@@ -374,16 +346,31 @@ async def get_allowed_row(user_id):
 
 async def is_allowed_and_consented(user_id):
     row = await get_allowed_row(user_id)
-    return bool(row and row.get("consented") is True)
+    if not row:
+        log.warning("Contact authorization denied: no allowlist row (sender_id=%s)", user_id)
+        return False
+    if row.get("consented") is not True:
+        log.warning("Contact authorization denied: consented is not true (sender_id=%s, consented=%r)",
+                    user_id, row.get("consented"))
+        return False
+    return True
 
 
 async def add_allowed(user_id, username):
-    await asyncio.to_thread(lambda: db.table("operator_allowed_users").upsert({
-        "telegram_user_id": int(user_id),
-        "username": username or "",
-        "consented": False,
-        "consented_at": None,
-    }).execute())
+    # Повторное добавление не должно сбрасывать ранее зафиксированное согласие.
+    uid = int(user_id)
+    existing = await get_allowed_row(uid)
+    if existing:
+        await asyncio.to_thread(lambda: db.table("operator_allowed_users").update({
+            "username": username or existing.get("username") or "",
+        }).eq("telegram_user_id", uid).execute())
+    else:
+        await asyncio.to_thread(lambda: db.table("operator_allowed_users").insert({
+            "telegram_user_id": uid,
+            "username": username or "",
+            "consented": False,
+            "consented_at": None,
+        }).execute())
 
 
 async def set_consent(user_id, consented=True):
@@ -886,7 +873,14 @@ async def build_context(target, media_context=""):
         entity = await target.get_input_chat()
     else:
         entity = await user_client.get_entity(target)
-    messages = await user_client.get_messages(entity, limit=CONTEXT_MESSAGES)
+    # Для каждого входящего события используем историю только до этого сообщения.
+    # Иначе при обработке очереди более поздние сообщения попадут в ранние ответы.
+    if hasattr(target, "message") and getattr(target.message, "id", None):
+        messages = await user_client.get_messages(
+            entity, limit=CONTEXT_MESSAGES, max_id=int(target.message.id) + 1
+        )
+    else:
+        messages = await user_client.get_messages(entity, limit=CONTEXT_MESSAGES)
     context = []
     for item in reversed(messages):
         body = (item.message or "").strip()
@@ -1021,21 +1015,16 @@ async def process_event(event):
     if not await is_allowed_and_consented(sender_id):
         log.info("Incoming update ignored: contact not allowed/consented (sender_id=%s)", sender_id)
         return
-    log.info("Generating AI reply (sender_id=%s)", sender_id)
+    started_at = asyncio.get_running_loop().time()
+    log.info("Generating AI reply (sender_id=%s, message_id=%s)",
+             sender_id, getattr(event.message, "id", None))
     generated = await answer_with_ai(event)
     if not generated or not generated.get("parts"):
         log.warning("AI returned empty reply (sender_id=%s)", sender_id)
         return
     parts = generated["parts"]
-    # Avoid exact duplicate consecutive replies caused by Telegram update retries.
-    recent = await user_client.get_messages(await event.get_input_chat(), limit=12)
-    candidate = " ".join(parts[0].lower().split())
-    if len(candidate) >= 45:
-        for prior in recent:
-            old = " ".join((prior.message or "").lower().split())
-            if prior.out and len(old) >= 45 and difflib.SequenceMatcher(None, candidate, old).ratio() >= 0.94:
-                log.warning("Repeated reply suppressed (sender_id=%s)", sender_id)
-                return
+    # Каждое входящее сообщение обрабатывается отдельно; не подавляем похожие ответы,
+    # иначе разные сообщения пользователя могут остаться без ответа.
     await event.respond(parts[0])
     if len(parts) == 2:
         await asyncio.sleep(random.uniform(MULTIPART_DELAY_MIN, MULTIPART_DELAY_MAX))
@@ -1050,20 +1039,21 @@ async def process_event(event):
             ))
         except Exception:
             log.debug("Could not add message reaction", exc_info=True)
-    log.info("AI reply sent (sender_id=%s, parts=%s)", sender_id, len(parts))
-    await record_stat("reply_sent", sender_id)
-    await refresh_contact_memory(sender_id, event)
+    elapsed = asyncio.get_running_loop().time() - started_at
+    log.info("AI reply sent (sender_id=%s, parts=%s, incoming_message_id=%s, processing_seconds=%.2f)",
+             sender_id, len(parts), getattr(event.message, "id", None), elapsed)
+    # Не задерживаем следующий ответ статистикой/обновлением памяти.
+    asyncio.create_task(record_stat("reply_sent", sender_id))
+    asyncio.create_task(refresh_contact_memory(sender_id, event))
 
 
 async def worker(user_id):
     q = queues[user_id]
     while not stopping:
         event = await q.get()
-        # Coalesce a short burst of messages into one response using the full Telegram context.
-        await asyncio.sleep(random.uniform(DEBOUNCE_MIN_SECONDS, DEBOUNCE_MAX_SECONDS))
-        while not q.empty():
-            with suppress(asyncio.QueueEmpty):
-                event = q.get_nowait()
+        # Небольшая пауза только для группировки доставки Telegram; сообщения из очереди
+        # не удаляем: каждое событие должно получить собственный ответ.
+        await asyncio.sleep(0.25)
         try:
             await process_event(event)
         except FloodWaitError as exc:
@@ -1106,9 +1096,7 @@ async def on_new_message(event):
         if q is None:
             q = asyncio.Queue(maxsize=MAX_QUEUE_PER_USER)
             queues[sender_id] = q
-        if q.full():
-            with suppress(asyncio.QueueEmpty):
-                q.get_nowait()
+        # Не выбрасываем старые события при всплеске сообщений.
         q.put_nowait(event)
         task = workers.get(sender_id)
         if task is None or task.done():
@@ -1241,13 +1229,10 @@ async def main():
     lease_task = None
     lease_acquired = False
     try:
-        # Acquire the singleton lease before starting HTTP endpoints or doing
-        # any database/Telegram initialization that could have side effects.
-        await acquire_instance_lease()
-        lease_acquired = True
-
         runner = await run_web()
         await initialize_settings()
+        await acquire_instance_lease()
+        lease_acquired = True
 
         control_bot = await bot.get_me()
         CONTROL_BOT_ID = int(control_bot.id)
