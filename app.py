@@ -913,8 +913,13 @@ async def answer_with_ai(target, extra_instruction=None):
     messages = [{"role": "system", "content": system}] + context
     candidates = list(dict.fromkeys([AI_MODEL] + AI_MODEL_FALLBACKS))
     last_error = None
-    for model_name in candidates:
+    for model_index, model_name in enumerate(candidates, start=1):
         try:
+            log.info(
+                "Requesting AI completion (sender_id=%s, model=%s, attempt=%s/%s)",
+                getattr(target, "sender_id", target if isinstance(target, int) else None),
+                model_name, model_index, len(candidates)
+            )
             response = await llm.chat.completions.create(
                 model=model_name,
                 messages=messages,
@@ -922,7 +927,7 @@ async def answer_with_ai(target, extra_instruction=None):
                 top_p=0.9,
                 max_tokens=600,
                 response_format={"type": "json_object"},
-                timeout=45.0,
+                timeout=35.0,
             )
             raw = (response.choices[0].message.content or "").strip()
             try:
@@ -933,22 +938,41 @@ async def answer_with_ai(target, extra_instruction=None):
                     parts = [parts]
                 parts = [str(x).strip() for x in parts if str(x).strip()][:2]
             except (ValueError, TypeError, AttributeError):
-                parts = [raw]
+                parts = [raw] if raw else []
                 reaction = None
+
             if not parts:
-                return {"parts": [], "reaction": None}
+                log.warning(
+                    "AI model returned an empty/invalid answer (model=%s, sender_id=%s); trying fallback",
+                    model_name, getattr(target, "sender_id", target if isinstance(target, int) else None)
+                )
+                continue
             if len(parts) > 1 and not allow_two:
                 parts = [" ".join(parts)]
             parts = [x[:MAX_REPLY_CHARS] for x in parts]
             if model_name != AI_MODEL:
-                log.warning("Primary model unavailable; fallback model succeeded: %s", model_name)
+                log.warning("Fallback AI model succeeded: %s", model_name)
             return {"parts": parts, "reaction": reaction}
-        except NotFoundError as exc:
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Groq can reject a request for reasons other than an unknown model
+            # (rate limits, temporary 5xx, overloaded model, unsupported options).
+            # Previously only NotFoundError triggered fallback, so one transient
+            # primary-model failure silently ended that user's reply attempt.
             last_error = exc
-            log.warning("Groq model unavailable (model=%s); trying fallback", model_name)
+            log.warning(
+                "AI model request failed; trying next configured model "
+                "(model=%s, error=%s, sender_id=%s)",
+                model_name, type(exc).__name__,
+                getattr(target, "sender_id", target if isinstance(target, int) else None),
+                exc_info=True,
+            )
             continue
+
     if last_error is not None:
-        log.error("All configured Groq models are unavailable")
+        log.error("All configured AI models failed; no reply could be generated")
         raise last_error
     return {"parts": [], "reaction": None}
 
@@ -1049,21 +1073,39 @@ async def process_event(event):
 
 async def worker(user_id):
     q = queues[user_id]
-    while not stopping:
-        event = await q.get()
-        # Небольшая пауза только для группировки доставки Telegram; сообщения из очереди
-        # не удаляем: каждое событие должно получить собственный ответ.
-        await asyncio.sleep(0.25)
-        try:
-            await process_event(event)
-        except FloodWaitError as exc:
-            delay = max(1, int(exc.seconds))
-            log.warning("Telegram rate limit: wait %s seconds", delay)
-            await asyncio.sleep(delay)
-            with suppress(Exception):
+    log.info("Message worker started (sender_id=%s)", user_id)
+    try:
+        while not stopping:
+            event = await q.get()
+            message_id = getattr(getattr(event, "message", None), "id", None)
+            try:
+                log.info(
+                    "Queued message picked up (sender_id=%s, message_id=%s, queue_size=%s)",
+                    user_id, message_id, q.qsize()
+                )
                 await process_event(event)
-        except Exception as exc:
-            log.exception("Message processing failed for %s: %s", user_id, type(exc).__name__)
+            except FloodWaitError as exc:
+                delay = max(1, int(exc.seconds))
+                log.warning("Telegram rate limit (sender_id=%s): wait %s seconds", user_id, delay)
+                await asyncio.sleep(delay)
+                try:
+                    await process_event(event)
+                except Exception:
+                    log.exception(
+                        "Message retry after FloodWait failed (sender_id=%s, message_id=%s)",
+                        user_id, message_id
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "Message processing failed (sender_id=%s, message_id=%s)",
+                    user_id, message_id
+                )
+            finally:
+                q.task_done()
+    finally:
+        log.warning("Message worker stopped (sender_id=%s)", user_id)
 
 
 @user_client.on(events.NewMessage(incoming=True))
@@ -1096,11 +1138,18 @@ async def on_new_message(event):
         if q is None:
             q = asyncio.Queue(maxsize=MAX_QUEUE_PER_USER)
             queues[sender_id] = q
-        # Не выбрасываем старые события при всплеске сообщений.
+        # Не выбрасываем входящие события: каждое ставится в очередь своего собеседника.
         q.put_nowait(event)
         task = workers.get(sender_id)
         if task is None or task.done():
-            workers[sender_id] = asyncio.create_task(worker(sender_id))
+            workers[sender_id] = asyncio.create_task(
+                worker(sender_id), name=f"message-worker-{sender_id}"
+            )
+            log.info("Message worker scheduled (sender_id=%s)", sender_id)
+        log.info(
+            "Incoming message queued (sender_id=%s, message_id=%s, queue_size=%s)",
+            sender_id, getattr(event.message, "id", None), q.qsize()
+        )
         asyncio.create_task(update_contact_incoming_safely(sender_id))
         asyncio.create_task(record_stat("incoming_message", sender_id))
     except Exception:
@@ -1156,7 +1205,7 @@ async def scheduler_loop():
                         attempt_time = iso(current)
                         await mark_initiative_attempt(uid, attempt_time)
                         try:
-                            answer = await answer_with_ai(
+                            answer_result = await answer_with_ai(
                                 uid,
                                 "Это инициативное продолжение разговора после паузы. "
                                 "Внимательно изучи доступную историю. Напиши одно короткое, "
@@ -1164,7 +1213,9 @@ async def scheduler_loop():
                                 "тему или задаёт содержательный вопрос. Не пиши пустое приветствие. "
                                 "Если естественного повода продолжить нет, верни ровно [SKIP].",
                             )
-                            if answer and answer.strip() != "[SKIP]":
+                            answer_parts = (answer_result or {}).get("parts", [])
+                            answer = " ".join(answer_parts).strip()
+                            if answer and answer != "[SKIP]":
                                 await user_client.send_message(uid, answer)
                                 log.info("Initiative message sent to contact %s", uid)
                             else:
@@ -1259,6 +1310,10 @@ async def main():
         telethon_task = asyncio.create_task(user_client.run_until_disconnected(), name="telethon-updates")
         scheduler_task = asyncio.create_task(scheduler_loop(), name="initiative-scheduler")
         lease_task = asyncio.create_task(renew_instance_lease(), name="singleton-lease-renewal")
+        log.info(
+            "AI reply pipeline ready (primary_model=%s, fallback_models=%s)",
+            AI_MODEL, ",".join(AI_MODEL_FALLBACKS) or "none"
+        )
         log.info("Starting aiogram polling (single instance)")
         await dp.start_polling(bot, handle_signals=False)
     except Exception:
