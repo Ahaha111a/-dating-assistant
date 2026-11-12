@@ -897,7 +897,8 @@ async def answer_with_ai(target, extra_instruction=None):
     if not context:
         return {"parts": [], "reaction": None}
     system = await system_prompt()
-    memory = await load_contact_memory(target.sender_id)
+    target_user_id = getattr(target, "sender_id", target if isinstance(target, int) else None)
+    memory = await load_contact_memory(target_user_id) if target_user_id is not None else ""
     if memory:
         system += "\n\nКРАТКАЯ ПАМЯТЬ О СОБЕСЕДНИКЕ (используй только как подтверждённый контекст):\n" + memory
     allow_two = random.random() < MULTIPART_PROBABILITY
@@ -1031,6 +1032,55 @@ async def record_stat(event_type, user_id=None):
         log.debug("Could not record statistic: %s", event_type, exc_info=True)
 
 
+async def send_reply_part(event, text, part_number=1):
+    """Send through the live peer from the update, with bounded retry and explicit confirmation."""
+    peer = await event.get_input_chat()
+    message_id = getattr(event.message, "id", None)
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            sent = await asyncio.wait_for(
+                user_client.send_message(
+                    peer,
+                    text,
+                    reply_to=message_id,
+                    link_preview=False,
+                ),
+                timeout=25,
+            )
+            if sent is None:
+                raise RuntimeError("Telegram send_message returned no sent message")
+            log.info(
+                "Telegram reply part confirmed (sender_id=%s, incoming_message_id=%s, "
+                "sent_message_id=%s, part=%s, attempt=%s)",
+                event.sender_id, message_id, getattr(sent, "id", None), part_number, attempt
+            )
+            return sent
+        except asyncio.CancelledError:
+            raise
+        except FloodWaitError as exc:
+            last_error = exc
+            delay = max(1, int(exc.seconds))
+            log.warning(
+                "Telegram FloodWait while sending reply (sender_id=%s, part=%s, wait=%s)",
+                event.sender_id, part_number, delay
+            )
+            await asyncio.sleep(delay)
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "Telegram send attempt failed (sender_id=%s, incoming_message_id=%s, "
+                "part=%s, attempt=%s, error=%s)",
+                event.sender_id, message_id, part_number, attempt, type(exc).__name__,
+                exc_info=True
+            )
+            if attempt < 3:
+                await asyncio.sleep(min(2 ** (attempt - 1), 4))
+    raise RuntimeError(
+        f"Could not send reply to Telegram user {event.sender_id} after 3 attempts"
+    ) from last_error
+
+
 async def process_event(event):
     sender_id = event.sender_id
     if not await enabled():
@@ -1049,10 +1099,10 @@ async def process_event(event):
     parts = generated["parts"]
     # Каждое входящее сообщение обрабатывается отдельно; не подавляем похожие ответы,
     # иначе разные сообщения пользователя могут остаться без ответа.
-    await event.respond(parts[0])
+    await send_reply_part(event, parts[0], part_number=1)
     if len(parts) == 2:
         await asyncio.sleep(random.uniform(MULTIPART_DELAY_MIN, MULTIPART_DELAY_MAX))
-        await event.respond(parts[1])
+        await send_reply_part(event, parts[1], part_number=2)
     reaction = generated.get("reaction")
     if reaction in {"❤️", "👍", "😂", "🔥", "🥰", "😮", "👏", "🤔", "😢"}:
         try:
@@ -1105,7 +1155,18 @@ async def worker(user_id):
             finally:
                 q.task_done()
     finally:
-        log.warning("Message worker stopped (sender_id=%s)", user_id)
+        log.warning("Message worker stopped (sender_id=%s, queued_messages=%s)", user_id, q.qsize())
+        # A worker should never leave pending messages orphaned.
+        if not stopping and not q.empty():
+            current = asyncio.current_task()
+            if workers.get(user_id) is current:
+                workers[user_id] = asyncio.create_task(
+                    worker(user_id), name=f"message-worker-recovery-{user_id}"
+                )
+                log.warning(
+                    "Message worker automatically restarted (sender_id=%s, queued_messages=%s)",
+                    user_id, q.qsize()
+                )
 
 
 @user_client.on(events.NewMessage(incoming=True))
@@ -1272,6 +1333,55 @@ async def initialize_settings():
         await set_setting("system_prompt_version", prompt_version)
 
 
+async def telethon_connection_supervisor():
+    """Keep the user-account update stream alive; the admin bot must not mask a dead Telethon client."""
+    global TELETHON_ACCOUNT_ID
+    retry_delay = 5
+    while not stopping:
+        try:
+            if not user_client.is_connected():
+                log.warning("Telethon disconnected; reconnecting in %s seconds", retry_delay)
+                await asyncio.sleep(retry_delay)
+                if stopping:
+                    return
+                await user_client.connect()
+
+            if not await user_client.is_user_authorized():
+                raise RuntimeError("Telethon session is no longer authorized")
+
+            me = await asyncio.wait_for(user_client.get_me(), timeout=20)
+            if me is None:
+                raise RuntimeError("Telethon get_me returned no account")
+            current_id = int(me.id)
+            if TELETHON_ACCOUNT_ID is not None and current_id != TELETHON_ACCOUNT_ID:
+                raise RuntimeError(
+                    f"Telethon account changed unexpectedly: {TELETHON_ACCOUNT_ID} -> {current_id}"
+                )
+            TELETHON_ACCOUNT_ID = current_id
+            log.info(
+                "Telethon update stream active (account_id=%s username=@%s)",
+                current_id, getattr(me, "username", None)
+            )
+
+            # This coroutine returns when Telethon loses its update connection.
+            # The loop then reconnects instead of leaving aiogram polling alive alone.
+            await user_client.run_until_disconnected()
+            if not stopping:
+                log.warning("Telethon update stream ended; it will be restarted")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Telethon connection supervisor caught an error")
+        finally:
+            if not stopping and user_client.is_connected():
+                try:
+                    await user_client.disconnect()
+                except Exception:
+                    log.exception("Error while closing broken Telethon connection")
+        if not stopping:
+            await asyncio.sleep(retry_delay)
+
+
 async def main():
     global stopping, lease_task, CONTROL_BOT_ID, TELETHON_ACCOUNT_ID
     runner = None
@@ -1307,7 +1417,9 @@ async def main():
                 "TELEGRAM_SESSION авторизована не как личный пользовательский аккаунт. "
                 "Нужна StringSession обычного Telegram-аккаунта, не управляющего бота."
             )
-        telethon_task = asyncio.create_task(user_client.run_until_disconnected(), name="telethon-updates")
+        telethon_task = asyncio.create_task(
+            telethon_connection_supervisor(), name="telethon-connection-supervisor"
+        )
         scheduler_task = asyncio.create_task(scheduler_loop(), name="initiative-scheduler")
         lease_task = asyncio.create_task(renew_instance_lease(), name="singleton-lease-renewal")
         log.info(
