@@ -232,18 +232,46 @@ def _claim_lease():
 
 
 async def acquire_instance_lease():
-    try:
-        ok = await asyncio.to_thread(_claim_lease)
-    except Exception as exc:
-        log.exception("Could not claim singleton lease. Check that latest database/schema.sql was executed and Supabase RPC is available.")
-        raise RuntimeError(
-            "Не удалось получить блокировку запуска. Выполни обновлённый database/schema.sql в Supabase и проверь SUPABASE_SERVICE_ROLE_KEY."
-        ) from exc
-    if not ok:
-        raise RuntimeError(
-            "Другой экземпляр уже запущен с этим BOT_TOKEN. Оставь одну Railway Replica и останови дублирующие сервисы."
-        )
-    log.info("Singleton lease acquired (instance_id=%s)", INSTANCE_ID)
+    # Railway may briefly run the previous deployment while the new one starts.
+    # Never steal a still-valid lease; wait for the old process to release it or
+    # for its lease to expire. The SQL claim RPC remains the atomic authority.
+    max_attempts = 30
+    retry_delay = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ok = await asyncio.to_thread(_claim_lease)
+        except Exception as exc:
+            log.exception(
+                "Singleton lease RPC failed (attempt %s/%s). "
+                "Check Supabase connectivity, claim_operator_runtime_lock RPC "
+                "and SUPABASE_SERVICE_ROLE_KEY.",
+                attempt, max_attempts,
+            )
+            raise RuntimeError(
+                "Не удалось связаться с механизмом блокировки Supabase. "
+                "Проверь SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY и RPC-функцию."
+            ) from exc
+
+        if ok:
+            log.info(
+                "Singleton lease acquired (instance_id=%s, attempt=%s)",
+                INSTANCE_ID, attempt,
+            )
+            return
+
+        if attempt < max_attempts:
+            log.warning(
+                "Singleton lease is currently held by another process; "
+                "waiting %ss before retry (%s/%s).",
+                retry_delay, attempt, max_attempts,
+            )
+            await asyncio.sleep(retry_delay)
+
+    raise RuntimeError(
+        "Не удалось получить блокировку за 150 секунд: предыдущий экземпляр "
+        "всё ещё удерживает действующую lease. Проверь Railway Deployments "
+        "и логи старого процесса; защита от одновременного запуска сохранена."
+    )
 
 
 def _renew_lease():
@@ -1213,10 +1241,13 @@ async def main():
     lease_task = None
     lease_acquired = False
     try:
-        runner = await run_web()
-        await initialize_settings()
+        # Acquire the singleton lease before starting HTTP endpoints or doing
+        # any database/Telegram initialization that could have side effects.
         await acquire_instance_lease()
         lease_acquired = True
+
+        runner = await run_web()
+        await initialize_settings()
 
         control_bot = await bot.get_me()
         CONTROL_BOT_ID = int(control_bot.id)
