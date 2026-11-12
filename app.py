@@ -1,6 +1,10 @@
 import asyncio
+import base64
+import difflib
+import json
 import logging
 import os
+import random
 import uuid
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -11,7 +15,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from openai import AsyncOpenAI, NotFoundError
 from supabase import create_client
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
@@ -39,11 +43,15 @@ SUPABASE_URL = env("SUPABASE_URL")
 SUPABASE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
 
 # Быстрая модель по умолчанию. Можно переопределить через Railway AI_MODEL.
-AI_MODEL = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
-AI_MODEL_FALLBACKS = [model.strip() for model in os.getenv("AI_MODEL_FALLBACKS", "openai/gpt-oss-20b").split(",") if model.strip()]
-DEBOUNCE_SECONDS = 0.0  # respond without artificial delay
+AI_MODEL = os.getenv("AI_MODEL", "openai/gpt-oss-20b")
+AI_MODEL_FALLBACKS = [model.strip() for model in os.getenv("AI_MODEL_FALLBACKS", "qwen/qwen3.8-27b").split(",") if model.strip()]
+DEBOUNCE_MIN_SECONDS = 4.0
+DEBOUNCE_MAX_SECONDS = 7.0
+MULTIPART_PROBABILITY = 0.35
+MULTIPART_DELAY_MIN = 4.0
+MULTIPART_DELAY_MAX = 10.0
 MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "3500"))
-CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "16"))
+CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "30"))
 MAX_QUEUE_PER_USER = int(os.getenv("MAX_QUEUE_PER_USER", "100"))
 SCHEDULER_INTERVAL_SECONDS = int(os.getenv("SCHEDULER_INTERVAL_SECONDS", "60"))
 DEFAULT_INITIATIVE_HOURS = 6
@@ -68,6 +76,7 @@ DEFAULT_PROMPT = r"""# СИСТЕМНАЯ ИНСТРУКЦИЯ — TELEGRAM AI O
 - Не повторяй постоянно одни и те же выражения.
 - Подстраивайся под стиль, настроение и манеру общения собеседника.
 - Не используй чрезмерное количество эмодзи.
+- Не имитируй искусственный молодёжный сленг и не делай намеренных ошибок.
 - Не злоупотребляй длинными сообщениями.
 - Не превращай каждый ответ в список или инструкцию.
 - Избегай ощущения общения с автоматическим ботом.
@@ -87,7 +96,7 @@ DEFAULT_PROMPT = r"""# СИСТЕМНАЯ ИНСТРУКЦИЯ — TELEGRAM AI O
 - Если собеседник рассказывает о планах, при подходящем случае спрашивай, как они продвигаются.
 - Если разговор затихает, можешь предложить другую тему или задать ненавязчивый вопрос.
 
-Не задавай вопросы механически после каждого сообщения. Инициатива должна выглядеть естественно.
+Не задавай вопросы механически после каждого сообщения. Инициатива должна выглядеть естественно. Самораскрытие — только в ответ на вопросы собеседника; не выдумывай личные события, биографические факты или опыт.
 
 ## 4. Самостоятельное продолжение общения
 
@@ -441,6 +450,7 @@ def main_keyboard():
             [KeyboardButton(text="▶️ Включить ИИ"), KeyboardButton(text="⏸ Выключить ИИ")],
             [KeyboardButton(text="👥 Контакты"), KeyboardButton(text="🧠 Инструкция ИИ")],
             [KeyboardButton(text="⏰ Инициатива"), KeyboardButton(text="📊 Статус")],
+            [KeyboardButton(text="📊 Статистика")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -758,6 +768,14 @@ async def menu_and_text_handler(message: Message):
     elif text == "✅ Подтвердить согласие":
         admin_pending[user_id] = "consent"
         await send_admin(message, "Введи @username человека, который уже явно согласился на обработку сообщений ИИ.", contacts_keyboard())
+    elif text == "📊 Статистика":
+        try:
+            rows = (await asyncio.to_thread(lambda: db.table("operator_stats").select("event_type,count").order("event_type").execute())).data or []
+            summary = "\n".join(f"{r.get('event_type')}: {r.get('count')}" for r in rows) or "Пока статистики нет."
+            await send_admin(message, "📊 Статистика\n\n" + summary, main_keyboard())
+        except Exception:
+            log.exception("Stats query failed")
+            await send_admin(message, "Не удалось получить статистику. Проверь миграцию schema.sql.", main_keyboard())
     elif text == "👁 Показать инструкцию":
         await send_admin(message, "Текущая инструкция:\n\n" + await system_prompt(), prompt_keyboard())
     elif text == "✏️ Изменить инструкцию":
@@ -788,9 +806,54 @@ async def menu_and_text_handler(message: Message):
         await send_admin(message, await menu_text(), main_keyboard())
 
 
-async def build_context(target):
-    # The live event contains an InputPeer with access_hash. A bare numeric ID
-    # is insufficient for a first-time private contact in Telethon.
+async def extract_incoming_media(event):
+    """Convert supported incoming media to text/vision context without storing files."""
+    message = event.message
+    if not message or not message.media:
+        return ""
+    try:
+        if getattr(message, "voice", None) or getattr(message, "audio", None):
+            payload = await message.download_media(file=bytes)
+            if not payload:
+                return "[Голосовое сообщение: не удалось скачать файл]"
+            result = await llm.audio.transcriptions.create(
+                model=os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo"),
+                file=("voice.ogg", payload),
+                response_format="text",
+                timeout=45.0,
+            )
+            transcript = str(result).strip()
+            return "[Транскрипция голосового сообщения]: " + transcript[:5000]
+        if message.photo:
+            payload = await message.download_media(file=bytes)
+            if not payload:
+                return "[Фотография: не удалось скачать изображение]"
+            data_url = "data:image/jpeg;base64," + base64.b64encode(payload).decode("ascii")
+            vision_model = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
+            response = await llm.chat.completions.create(
+                model=vision_model,
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": "Кратко и объективно опиши изображение для контекста личной переписки. Не делай предположений о личности людей."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ]}],
+                max_tokens=250,
+                timeout=45.0,
+            )
+            return "[Описание фотографии]: " + ((response.choices[0].message.content or "").strip()[:3000])
+        if getattr(message, "video", None) or getattr(message, "video_note", None) or getattr(message, "gif", None):
+            caption = (message.message or "").strip()
+            return "[Получено видео/видеокружок; содержимое видео автоматически не распознано] " + caption
+        if message.document:
+            return "[Получен файл: " + (message.file.name or "без названия") + "]"
+    except Exception as exc:
+        log.warning("Media processing failed (sender_id=%s, kind=%s): %s", event.sender_id,
+                    "voice" if (getattr(message, "voice", None) or getattr(message, "audio", None)) else "photo/video", type(exc).__name__)
+        return "[Медиафайл получен, но его содержимое сейчас не удалось обработать]"
+    return ""
+
+
+async def build_context(target, media_context=""):
+    # Live event supplies an access-hash-bearing peer; numeric IDs alone may fail for new contacts.
     if hasattr(target, "get_input_chat"):
         entity = await target.get_input_chat()
     else:
@@ -798,24 +861,34 @@ async def build_context(target):
     messages = await user_client.get_messages(entity, limit=CONTEXT_MESSAGES)
     context = []
     for item in reversed(messages):
-        if item.message:
-            context.append({
-                "role": "assistant" if item.out else "user",
-                "content": item.message[:4000],
-            })
+        body = (item.message or "").strip()
+        if body:
+            context.append({"role": "assistant" if item.out else "user", "content": body[:4000]})
+    if media_context:
+        context.append({"role": "user", "content": media_context})
     return context
 
 
 async def answer_with_ai(target, extra_instruction=None):
-    context = await build_context(target)
+    media_context = await extract_incoming_media(target)
+    context = await build_context(target, media_context)
     if not context:
-        return ""
+        return {"parts": [], "reaction": None}
     system = await system_prompt()
+    memory = await load_contact_memory(event.sender_id)
+    if memory:
+        system += "\n\nКРАТКАЯ ПАМЯТЬ О СОБЕСЕДНИКЕ (используй только как подтверждённый контекст):\n" + memory
+    allow_two = random.random() < MULTIPART_PROBABILITY
+    system += "\n\nФОРМАТ ОТВЕТА: верни только JSON-объект вида {\"parts\":[\"текст\"],\"reaction\":null}. "
+    system += "Максимум две части. "
+    if allow_two:
+        system += "Если естественно разделить одну мысль на два самостоятельных коротких сообщения — верни две части; иначе одну. Не дроби искусственно."
+    else:
+        system += "Для этого ответа верни ровно одну часть."
+    system += " Поле reaction — null или одна уместная реакция из ❤️ 👍 😂 🔥 🥰 😮 👏 🤔 😢; не ставь реакцию автоматически, если она не подходит. Не включай markdown-блоки и не добавляй текст вне JSON."
     if extra_instruction:
-        system += "\n\nДОПОЛНИТЕЛЬНАЯ ЗАДАЧА ДЛЯ ЭТОГО ОТВЕТА:\n" + extra_instruction
+        system += "\n\nДОПОЛНИТЕЛЬНАЯ ЗАДАЧА: " + extra_instruction
     messages = [{"role": "system", "content": system}] + context
-    # A model can disappear or be unavailable for a particular Groq API key.
-    # Retry only model-not-found/access errors using configured fallback IDs.
     candidates = list(dict.fromkeys([AI_MODEL] + AI_MODEL_FALLBACKS))
     last_error = None
     for model_name in candidates:
@@ -823,21 +896,93 @@ async def answer_with_ai(target, extra_instruction=None):
             response = await llm.chat.completions.create(
                 model=model_name,
                 messages=messages,
-                temperature=0.7,
+                temperature=0.85,
+                top_p=0.9,
                 max_tokens=600,
-                timeout=30.0,
+                response_format={"type": "json_object"},
+                timeout=45.0,
             )
+            raw = (response.choices[0].message.content or "").strip()
+            try:
+                parsed = json.loads(raw)
+                parts = parsed.get("parts", []) if isinstance(parsed, dict) else []
+                reaction = parsed.get("reaction") if isinstance(parsed, dict) else None
+                if isinstance(parts, str):
+                    parts = [parts]
+                parts = [str(x).strip() for x in parts if str(x).strip()][:2]
+            except (ValueError, TypeError, AttributeError):
+                parts = [raw]
+                reaction = None
+            if not parts:
+                return {"parts": [], "reaction": None}
+            if len(parts) > 1 and not allow_two:
+                parts = [" ".join(parts)]
+            parts = [x[:MAX_REPLY_CHARS] for x in parts]
             if model_name != AI_MODEL:
                 log.warning("Primary model unavailable; fallback model succeeded: %s", model_name)
-            return (response.choices[0].message.content or "").strip()[:MAX_REPLY_CHARS]
+            return {"parts": parts, "reaction": reaction}
         except NotFoundError as exc:
             last_error = exc
-            log.warning("Groq model unavailable (model=%s); trying fallback if available", model_name)
+            log.warning("Groq model unavailable (model=%s); trying fallback", model_name)
             continue
     if last_error is not None:
-        log.exception("All configured Groq models are unavailable")
+        log.error("All configured Groq models are unavailable")
         raise last_error
-    return ""
+    return {"parts": [], "reaction": None}
+
+
+async def load_contact_memory(user_id):
+    try:
+        result = await asyncio.to_thread(lambda: db.table("operator_contact_memory").select("summary").eq("telegram_user_id", int(user_id)).limit(1).execute())
+        rows = result.data or []
+        return (rows[0].get("summary") or "").strip() if rows else ""
+    except Exception:
+        log.debug("Could not load contact memory", exc_info=True)
+        return ""
+
+
+async def refresh_contact_memory(user_id, event):
+    """Refresh a compact per-contact memory every fifth successful reply."""
+    try:
+        def increment():
+            row = db.table("operator_contact_memory").select("interaction_count,summary").eq("telegram_user_id", int(user_id)).limit(1).execute()
+            rows = row.data or []
+            if rows:
+                count = int(rows[0].get("interaction_count") or 0) + 1
+                db.table("operator_contact_memory").update({"interaction_count": count}).eq("telegram_user_id", int(user_id)).execute()
+                return count
+            db.table("operator_contact_memory").insert({"telegram_user_id": int(user_id), "interaction_count": 1, "summary": ""}).execute()
+            return 1
+        count = await asyncio.to_thread(increment)
+        if count % 5:
+            return
+        entity = await event.get_input_chat()
+        history = await user_client.get_messages(entity, limit=40)
+        transcript = "\n".join(("Денис: " if m.out else "Собеседник: ") + (m.message or "")[:1000] for m in reversed(history) if m.message)
+        if not transcript.strip():
+            return
+        response = await llm.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": "Составь краткую нейтральную память о собеседнике для будущего диалога. Сохраняй только явно сообщённые интересы, предпочтения, важные события, планы, незавершённые темы, неприятные темы и особенности общения. Не включай здоровье, религию, политические взгляды, этническую принадлежность, сексуальную жизнь или другие чувствительные сведения. Не делай догадок. Максимум 900 символов. Верни только текст."},
+                {"role": "user", "content": transcript},
+            ], temperature=0.2, max_tokens=300, timeout=30.0,
+        )
+        summary = (response.choices[0].message.content or "").strip()[:1200]
+        if summary:
+            await asyncio.to_thread(lambda: db.table("operator_contact_memory").update({"summary": summary, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("telegram_user_id", int(user_id)).execute())
+    except Exception:
+        log.warning("Contact memory refresh failed (sender_id=%s)", user_id, exc_info=True)
+
+
+async def record_stat(event_type, user_id=None):
+    try:
+        await asyncio.to_thread(lambda: db.rpc("increment_operator_stat", {
+            "p_event_type": event_type,
+            "p_telegram_user_id": int(user_id) if user_id is not None else None,
+        }).execute())
+    except Exception:
+        log.debug("Could not record statistic: %s", event_type, exc_info=True)
 
 
 async def process_event(event):
@@ -849,19 +994,48 @@ async def process_event(event):
         log.info("Incoming update ignored: contact not allowed/consented (sender_id=%s)", sender_id)
         return
     log.info("Generating AI reply (sender_id=%s)", sender_id)
-    answer = await answer_with_ai(event)
-    if answer:
-        await event.respond(answer)
-        log.info("AI reply sent (sender_id=%s)", sender_id)
-    else:
+    generated = await answer_with_ai(event)
+    if not generated or not generated.get("parts"):
         log.warning("AI returned empty reply (sender_id=%s)", sender_id)
+        return
+    parts = generated["parts"]
+    # Avoid exact duplicate consecutive replies caused by Telegram update retries.
+    recent = await user_client.get_messages(await event.get_input_chat(), limit=12)
+    candidate = " ".join(parts[0].lower().split())
+    if len(candidate) >= 45:
+        for prior in recent:
+            old = " ".join((prior.message or "").lower().split())
+            if prior.out and len(old) >= 45 and difflib.SequenceMatcher(None, candidate, old).ratio() >= 0.94:
+                log.warning("Repeated reply suppressed (sender_id=%s)", sender_id)
+                return
+    await event.respond(parts[0])
+    if len(parts) == 2:
+        await asyncio.sleep(random.uniform(MULTIPART_DELAY_MIN, MULTIPART_DELAY_MAX))
+        await event.respond(parts[1])
+    reaction = generated.get("reaction")
+    if reaction in {"❤️", "👍", "😂", "🔥", "🥰", "😮", "👏", "🤔", "😢"}:
+        try:
+            await user_client(functions.messages.SendReactionRequest(
+                peer=await event.get_input_chat(),
+                msg_id=event.message.id,
+                reaction=[types.ReactionEmoji(emoticon=reaction)],
+            ))
+        except Exception:
+            log.debug("Could not add message reaction", exc_info=True)
+    log.info("AI reply sent (sender_id=%s, parts=%s)", sender_id, len(parts))
+    await record_stat("reply_sent", sender_id)
+    await refresh_contact_memory(sender_id, event)
 
 
 async def worker(user_id):
     q = queues[user_id]
     while not stopping:
         event = await q.get()
-        # Immediate processing; no fixed debounce delay.
+        # Coalesce a short burst of messages into one response using the full Telegram context.
+        await asyncio.sleep(random.uniform(DEBOUNCE_MIN_SECONDS, DEBOUNCE_MAX_SECONDS))
+        while not q.empty():
+            with suppress(asyncio.QueueEmpty):
+                event = q.get_nowait()
         try:
             await process_event(event)
         except FloodWaitError as exc:
@@ -877,7 +1051,7 @@ async def worker(user_id):
 @user_client.on(events.NewMessage(incoming=True))
 async def on_new_message(event):
     sender_id = event.sender_id
-    if not event.is_private or sender_id is None or not (event.raw_text or "").strip():
+    if not event.is_private or sender_id is None or (not (event.raw_text or "").strip() and not getattr(event.message, "media", None)):
         return
 
     # Ignore messages from our own account and the separate management bot.
@@ -912,6 +1086,7 @@ async def on_new_message(event):
         if task is None or task.done():
             workers[sender_id] = asyncio.create_task(worker(sender_id))
         asyncio.create_task(update_contact_incoming_safely(sender_id))
+        asyncio.create_task(record_stat("incoming_message", sender_id))
     except Exception:
         log.exception("Incoming event handler failed (sender_id=%s)", sender_id)
 
@@ -1024,7 +1199,7 @@ async def initialize_settings():
 
     # Однократно устанавливаем новую согласованную инструкцию. В дальнейшем
     # пользовательские изменения через меню не перезаписываются при рестарте.
-    prompt_version = "2026-11-11-denis-persona-v1"
+    prompt_version = "2026-11-12-natural-dialogue-v2"
     if await get_setting("system_prompt_version") != prompt_version:
         await set_setting("system_prompt", DEFAULT_PROMPT)
         await set_setting("system_prompt_version", prompt_version)
