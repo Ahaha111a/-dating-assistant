@@ -875,7 +875,7 @@ async def answer_with_ai(target, extra_instruction=None):
     if not context:
         return {"parts": [], "reaction": None}
     system = await system_prompt()
-    memory = await load_contact_memory(event.sender_id)
+    memory = await load_contact_memory(target.sender_id)
     if memory:
         system += "\n\nКРАТКАЯ ПАМЯТЬ О СОБЕСЕДНИКЕ (используй только как подтверждённый контекст):\n" + memory
     allow_two = random.random() < MULTIPART_PROBABILITY
