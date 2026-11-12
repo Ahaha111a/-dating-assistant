@@ -902,13 +902,15 @@ async def answer_with_ai(target, extra_instruction=None):
     if memory:
         system += "\n\nКРАТКАЯ ПАМЯТЬ О СОБЕСЕДНИКЕ (используй только как подтверждённый контекст):\n" + memory
     allow_two = random.random() < MULTIPART_PROBABILITY
-    system += "\n\nФОРМАТ ОТВЕТА: верни только JSON-объект вида {\"parts\":[\"текст\"],\"reaction\":null}. "
+    system += "\n\nОТВЕТ: напиши естественный короткий ответ собеседнику на русском языке. "
+    system += "Верни JSON-объект вида {\"parts\":[\"текст\"],\"reaction\":null}, если можешь. "
+    system += "Если не получается сформировать JSON, верни обычный текст ответа — это допустимо. "
     system += "Максимум две части. "
     if allow_two:
         system += "Если естественно разделить одну мысль на два самостоятельных коротких сообщения — верни две части; иначе одну. Не дроби искусственно."
     else:
         system += "Для этого ответа верни ровно одну часть."
-    system += " Поле reaction — null или одна уместная реакция из ❤️ 👍 😂 🔥 🥰 😮 👏 🤔 😢; не ставь реакцию автоматически, если она не подходит. Не включай markdown-блоки и не добавляй текст вне JSON."
+    system += " Поле reaction — null или одна уместная реакция из ❤️ 👍 😂 🔥 🥰 😮 👏 🤔 😢; не ставь реакцию автоматически, если она не подходит."
     if extra_instruction:
         system += "\n\nДОПОЛНИТЕЛЬНАЯ ЗАДАЧА: " + extra_instruction
     messages = [{"role": "system", "content": system}] + context
@@ -927,20 +929,42 @@ async def answer_with_ai(target, extra_instruction=None):
                 temperature=0.85,
                 top_p=0.9,
                 max_tokens=600,
-                response_format={"type": "json_object"},
+                # Не включаем response_format=json_object: некоторые Groq-модели
+                # возвращают обычный текст, а строгая серверная JSON-валидация
+                # отклоняет его HTTP 400 ещё до того, как мы можем разобрать ответ.
                 timeout=35.0,
             )
             raw = (response.choices[0].message.content or "").strip()
+            # Модель может вернуть JSON, JSON в markdown-ограждении или обычный
+            # текст. Все три варианта считаются допустимым ответом.
+            candidate_json = raw
+            if candidate_json.startswith("```"):
+                candidate_json = candidate_json.strip("`").strip()
+                if candidate_json.lower().startswith("json"):
+                    candidate_json = candidate_json[4:].strip()
+            parsed = None
             try:
-                parsed = json.loads(raw)
-                parts = parsed.get("parts", []) if isinstance(parsed, dict) else []
-                reaction = parsed.get("reaction") if isinstance(parsed, dict) else None
-                if isinstance(parts, str):
-                    parts = [parts]
-                parts = [str(x).strip() for x in parts if str(x).strip()][:2]
-            except (ValueError, TypeError, AttributeError):
+                parsed = json.loads(candidate_json)
+            except (ValueError, TypeError):
+                parsed = None
+            reaction = None
+            parts = []
+            if isinstance(parsed, dict):
+                reaction = parsed.get("reaction")
+                parts_value = parsed.get("parts")
+                if parts_value is None:
+                    parts_value = parsed.get("reply", parsed.get("text", parsed.get("message")))
+                if isinstance(parts_value, str):
+                    parts = [parts_value]
+                elif isinstance(parts_value, list):
+                    parts = [str(x) for x in parts_value if x is not None]
+            elif isinstance(parsed, str):
+                parts = [parsed]
+            else:
+                # Не теряем осмысленный ответ только потому, что модель
+                # не соблюла необязательный формат JSON.
                 parts = [raw] if raw else []
-                reaction = None
+            parts = [str(x).strip() for x in parts if str(x).strip()][:2]
 
             if not parts:
                 log.warning(
@@ -951,6 +975,8 @@ async def answer_with_ai(target, extra_instruction=None):
             if len(parts) > 1 and not allow_two:
                 parts = [" ".join(parts)]
             parts = [x[:MAX_REPLY_CHARS] for x in parts]
+            if reaction not in {"❤️", "👍", "😂", "🔥", "🥰", "😮", "👏", "🤔", "😢"}:
+                reaction = None
             if model_name != AI_MODEL:
                 log.warning("Fallback AI model succeeded: %s", model_name)
             return {"parts": parts, "reaction": reaction}
