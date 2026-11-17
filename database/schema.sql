@@ -20,7 +20,7 @@ alter table public.operator_allowed_users
 alter table public.operator_allowed_users
     add column if not exists consented_at timestamptz;
 
--- Служебные временные отметки для устойчивого планировщика.
+-- Служебные временные отметки активности контактов.
 -- Никакие тексты сообщений не записываются.
 create table if not exists public.operator_contact_state (
     telegram_user_id bigint primary key,
@@ -40,9 +40,7 @@ alter table public.operator_contact_state enable row level security;
 -- с серверной переменной SUPABASE_SERVICE_ROLE_KEY.
 insert into public.operator_settings(key, value)
 values
-    ('enabled', 'false'),
-    ('initiative_enabled', 'true'),
-    ('initiative_hours', '6')
+    ('enabled', 'false')
 on conflict (key) do nothing;
 
 
@@ -134,6 +132,46 @@ create table if not exists public.operator_stats (
 );
 alter table public.operator_stats enable row level security;
 
+
+
+
+-- Compact per-contact memory: no raw chat history is copied into this table.
+create table if not exists public.operator_contact_memory (
+    telegram_user_id bigint primary key,
+    summary text not null default '',
+    interaction_count integer not null default 0,
+    updated_at timestamptz not null default now()
+);
+alter table public.operator_contact_memory enable row level security;
+
+notify pgrst, 'reload schema';
+
+
+-- Durable incoming-message queue. Only Telegram IDs/status are stored; message text and media remain in Telegram.
+create table if not exists public.operator_pending_messages (
+    id bigserial primary key,
+    telegram_user_id bigint not null,
+    telegram_message_id bigint not null,
+    status text not null default 'pending' check (status in ('pending','processed','ignored','unavailable')),
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    unique (telegram_user_id, telegram_message_id)
+);
+create index if not exists operator_pending_messages_pending_idx
+    on public.operator_pending_messages(status, created_at)
+    where status = 'pending';
+alter table public.operator_pending_messages enable row level security;
+
+-- Per-contact counters used by the private admin panel.
+create table if not exists public.operator_contact_stats (
+    telegram_user_id bigint not null,
+    event_type text not null,
+    count bigint not null default 0,
+    updated_at timestamptz not null default now(),
+    primary key (telegram_user_id, event_type)
+);
+alter table public.operator_contact_stats enable row level security;
+
 create or replace function public.increment_operator_stat(
     p_event_type text,
     p_telegram_user_id bigint default null
@@ -150,6 +188,13 @@ begin
       set count = public.operator_stats.count + 1,
           updated_at = now()
     returning count into new_count;
+    if p_telegram_user_id is not null then
+        insert into public.operator_contact_stats(telegram_user_id, event_type, count, updated_at)
+        values (p_telegram_user_id, p_event_type, 1, now())
+        on conflict (telegram_user_id, event_type) do update
+          set count = public.operator_contact_stats.count + 1,
+              updated_at = now();
+    end if;
     return new_count;
 end;
 $$;
@@ -158,13 +203,69 @@ grant execute on function public.increment_operator_stat(text, bigint) to servic
 notify pgrst, 'reload schema';
 
 
--- Compact per-contact memory: no raw chat history is copied into this table.
-create table if not exists public.operator_contact_memory (
+-- Explicit admin blacklist. A blocked contact can never pass the access gate.
+create table if not exists public.operator_blocked_users (
     telegram_user_id bigint primary key,
-    summary text not null default '',
-    interaction_count integer not null default 0,
-    updated_at timestamptz not null default now()
+    username text not null default '',
+    reason text not null default 'admin_block',
+    created_at timestamptz not null default now()
 );
-alter table public.operator_contact_memory enable row level security;
+alter table public.operator_blocked_users enable row level security;
+notify pgrst, 'reload schema';
 
+
+-- Version history for admin-edited system prompts.
+create table if not exists public.operator_prompt_versions (
+    id bigserial primary key,
+    prompt text not null,
+    created_at timestamptz not null default now()
+);
+alter table public.operator_prompt_versions enable row level security;
+notify pgrst, 'reload schema';
+
+
+-- Explicit server-role privileges; RLS remains enabled and no public policies are added.
+grant all on table public.operator_settings to service_role;
+grant all on table public.operator_allowed_users to service_role;
+grant all on table public.operator_contact_state to service_role;
+grant all on table public.operator_runtime_lock to service_role;
+grant all on table public.operator_stats to service_role;
+grant all on table public.operator_contact_memory to service_role;
+grant all on table public.operator_pending_messages to service_role;
+grant all on table public.operator_contact_stats to service_role;
+grant all on table public.operator_blocked_users to service_role;
+grant all on table public.operator_prompt_versions to service_role;
+grant usage, select on all sequences in schema public to service_role;
+notify pgrst, 'reload schema';
+
+-- Futures trader research module. Paper trades only; no exchange credentials or live orders.
+create table if not exists public.operator_trader_trades (
+    id bigserial primary key,
+    symbol text not null,
+    side text not null check (side in ('LONG','SHORT')),
+    entry_price double precision not null,
+    quantity double precision not null,
+    stop_price double precision not null,
+    take_price double precision not null,
+    risk_usd double precision not null,
+    entry_fee double precision not null default 0,
+    entry_time timestamptz not null default now(),
+    exit_price double precision,
+    exit_time timestamptz,
+    gross_pnl double precision,
+    fees double precision,
+    net_pnl double precision,
+    close_reason text,
+    strategy text not null,
+    status text not null default 'open' check (status in ('open','closed'))
+);
+create index if not exists operator_trader_trades_status_idx
+    on public.operator_trader_trades(status, id desc);
+alter table public.operator_trader_trades enable row level security;
+grant all on table public.operator_trader_trades to service_role;
+grant usage, select on sequence public.operator_trader_trades_id_seq to service_role;
+insert into public.operator_settings(key, value) values
+    ('trader_demo_enabled','false'),
+    ('trader_paper_balance','10000')
+on conflict (key) do nothing;
 notify pgrst, 'reload schema';
